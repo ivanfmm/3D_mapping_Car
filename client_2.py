@@ -32,6 +32,7 @@ def send_commands():
 # ── Hilo Principal: Recibir y mostrar video ──
 def receive_video():
     vid_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    vid_sock.settimeout(1.0) # <--- 1. AGREGAR ESTE LÍMITE DE TIEMPO
     vid_sock.connect((PI_IP, 9998))
     data = b''
     # Usamos '<L' para forzar 4 bytes estandarizados entre la Pi y la PC
@@ -39,22 +40,34 @@ def receive_video():
 
     try:
         while True:
-            # 1. Leer el tamaño del mensaje
-            while len(data) < payload_size:
-                packet = vid_sock.recv(4096)
-                if not packet: break
-                data += packet
-            
-            packed_size = data[:payload_size]
-            data = data[payload_size:]
-            msg_size = struct.unpack('<L', packed_size)[0]
+            try: # <--- 2. ENVOLVER LA LECTURA EN UN TRY
+                # 1. Leer el tamaño del mensaje
+                while len(data) < payload_size:
+                    packet = vid_sock.recv(4096)
+                    # Cambiamos break por raise para manejar la desconexión limpiamente
+                    if not packet: raise ConnectionError 
+                    data += packet
+                
+                packed_size = data[:payload_size]
+                data = data[payload_size:]
+                msg_size = struct.unpack('<L', packed_size)[0]
 
-            # 2. Leer los bytes de la imagen JPEG
-            while len(data) < msg_size:
-                data += vid_sock.recv(4096)
-            
-            frame_data = data[:msg_size]
-            data = data[msg_size:]
+                # 2. Leer los bytes de la imagen JPEG
+                while len(data) < msg_size:
+                    packet = vid_sock.recv(4096)
+                    if not packet: raise ConnectionError
+                    data += packet
+                
+                frame_data = data[:msg_size]
+                data = data[msg_size:]
+
+            except socket.timeout: # <--- 3. ATRAPAR EL ERROR DE RED LENTA
+                print("Señal débil o lag, saltando frame para no congelar...")
+                data = b'' # Limpiar los datos a medias para recibir uno nuevo
+                continue 
+            except ConnectionError:
+                print("Conexión perdida con la Raspberry Pi.")
+                break
 
             # 3. Decodificar el JPEG comprimido a Matriz de OpenCV
             frame_np = np.frombuffer(frame_data, dtype=np.uint8)

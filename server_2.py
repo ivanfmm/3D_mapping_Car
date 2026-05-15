@@ -95,6 +95,14 @@ def main():
     
     t1.join()
     t2.join()
+    print("Esperando conexion...")
+    cmd_conn, _ = cmd_sock.accept()
+    vid_conn, _ = vid_sock.accept()
+    print("Cliente conectado!")
+
+    # --- AGREGAR ESTAS DOS LÍNEAS ---
+    cmd_conn.settimeout(1.0) 
+    vid_conn.settimeout(0.5)
 
 if __name__ == '__main__':
     main()
