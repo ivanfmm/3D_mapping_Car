@@ -87,6 +87,7 @@ def receive_video():
     finally:
         cv2.destroyAllWindows()
         vid_sock.close()
+        
 
 # ── Main ──
 if __name__ == '__main__':
