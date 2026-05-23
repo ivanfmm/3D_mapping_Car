@@ -70,8 +70,11 @@ def stream_video(conn):
             print("No se pudo abrir la camara")
             return
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+	cap.set(cv2.CAP_PROP_FPS, 60)
+	print(f"Camara: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
+
 
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
 
