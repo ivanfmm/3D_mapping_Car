@@ -8,6 +8,9 @@ from motor import Ordinary_Car
 car = Ordinary_Car()
 stop_event = threading.Event()
 
+WIDTH, HEIGHT = 2560, 720
+FPS = 60
+
 COMMANDS = {
     'w': (600, 600, 600, 600),
     's': (-600, -600, -600, -600),
@@ -70,9 +73,9 @@ def stream_video(conn):
             print("No se pudo abrir la camara")
             return
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, FPS)
         print(f"Camara: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
 
 

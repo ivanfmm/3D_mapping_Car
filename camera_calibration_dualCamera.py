@@ -45,6 +45,10 @@ CRITERIO = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 #   CALIB_FIX_INTRINSIC  → usa las matrices intrínsecas ya calculadas (más estable)
 FLAGS_ESTEREO = cv.CALIB_FIX_INTRINSIC
 
+WIDTH = 2560  # ancho total del frame (dos lentes lado a lado)
+HEIGHT = 720  # alto del frame
+FPS = 60      # frames por segundo (ajusta según tu cámara)
+
 
 # ───────────────────────────────────────────────────────────────
 #  UTILIDADES COMUNES
@@ -238,9 +242,9 @@ def modo_captura(indice_cam=0, carpeta=CARPETA_CAP):
         return
 
     # Intentar forzar resolución 2560×720 (dos lentes 1280×720 lado a lado)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH,  2560)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT,  720)
-    cap.set(cv.CAP_PROP_FPS,           60)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH,  WIDTH)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+    cap.set(cv.CAP_PROP_FPS,           FPS)
 
     os.makedirs(carpeta, exist_ok=True)
     contador = len(glob.glob(os.path.join(carpeta, "izq_*.jpg"))) + 1
