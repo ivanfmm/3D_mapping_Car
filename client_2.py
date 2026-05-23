@@ -3,8 +3,12 @@ client_3.py - Cliente estereo con rectificacion + RAFT-Stereo en GPU
 =====================================================================
 Flujo por frame:
   raw frame  ->  split izq/der  ->  remap (rectificacion)
-             ->  RAFT-Stereo GPU  ->  mapa de disparidad
+             ->  RAFT-Stereo GPU  ->  mapa de disparidad  ->  vo_worker CPU
              ->  mostrar + guardar (frames rectificados + disparidad)
+
+Arquitectura de hilos:
+  video_loop (principal) -> infer_queue -> inference_worker (GPU)
+                                       -> vo_queue          -> vo_worker (CPU)
 
 Controles: W/A/S/D = mover carrito | Q = frenar | X = salir
 """
@@ -24,7 +28,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from visual_odometry import VisualOdometry  # clase ORB-SLAM2-like para comparar con RAFT-Stereo
+from visual_odometry import VisualOdometry
 
 if os.name == 'nt':
     import msvcrt
@@ -36,14 +40,14 @@ else:
 # ==================================================================
 #  CONFIGURACION - ajusta paths si cambias de maquina
 # ==================================================================
-PI_IP          = '10.42.0.146'
+PI_IP          = '10.14.221.32'
 CAL_JSON       = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/parac/estereo_cal.json')
 RAFT_DIR       = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/corrercudapytorch/RAFT-Stereo')
 RAFT_MODEL     = RAFT_DIR / 'models/raftstereo-middlebury.pth'
 SAVE_ROOT      = Path('captured_frames')
 SAVE_FRAMES    = True
 MAX_FRAME_SIZE = 50 * 1024 * 1024
-INFER_ITERS    = 20   # iteraciones RAFT (mas = mas calidad, mas lento)
+INFER_ITERS    = 7   # iteraciones RAFT (mas = mas calidad, mas lento)
 
 # -- RAFT-Stereo path setup ----------------------------------------
 sys.path.insert(0, str(RAFT_DIR))
@@ -54,7 +58,8 @@ from raft_stereo import RAFTStereo
 stop_event     = threading.Event()
 command_socket = None
 command_lock   = threading.Lock()
-infer_queue    = queue.Queue(maxsize=2)        # cola entre video e inferencia
+infer_queue    = queue.Queue(maxsize=2)   # video -> RAFT (GPU)
+vo_queue       = queue.Queue(maxsize=2)   # RAFT  -> VO   (CPU)
 latest_disp    = {'img': None, 'lock': threading.Lock()}
 
 
@@ -108,28 +113,25 @@ def load_rectification(cal_path, lens_w, lens_h):
     Carga el JSON de calibracion y calcula los mapas de rectificacion
     escalados a la resolucion real del stream.
 
-    El JSON fue generado a 1280x720 por lente.
-    Si el server transmite a menor resolucion, se escalan las matrices K.
-
     Retorna:
       maps_izq  - (map1, map2) para cv2.remap del lente izquierdo
       maps_der  - (map1, map2) para cv2.remap del lente derecho
-      Q         - matriz de reproyeccion disparidad->3D (para point cloud)
+      Q         - matriz de reproyeccion disparidad->3D
+      K_rect    - matriz K exacta del lente izquierdo rectificado (P1[:3,:3])
     """
     with open(cal_path) as f:
         cal = json.load(f)
 
-    # Resolucion con la que se calibro (por lente)
-    cal_w, cal_h = cal['lente_izquierdo']['resolucion']   # [1280, 720]
+    cal_w, cal_h = cal['lente_izquierdo']['resolucion']
     sx = lens_w / cal_w
     sy = lens_h / cal_h
 
     def scale_K(K_list):
         K = np.array(K_list, dtype=np.float64)
-        K[0, 0] *= sx   # fx
-        K[1, 1] *= sy   # fy
-        K[0, 2] *= sx   # cx
-        K[1, 2] *= sy   # cy
+        K[0, 0] *= sx
+        K[1, 1] *= sy
+        K[0, 2] *= sx
+        K[1, 2] *= sy
         return K
 
     K_izq  = scale_K(cal['lente_izquierdo']['matriz_camara'])
@@ -138,7 +140,6 @@ def load_rectification(cal_path, lens_w, lens_h):
     D_der  = np.array(cal['lente_derecho']['coef_distorsion'], dtype=np.float64)
     R      = np.array(cal['estereo']['R'], dtype=np.float64)
     T      = np.array(cal['estereo']['T'], dtype=np.float64)
-    # T esta en mm (espacio 3D real), no se escala
 
     size = (lens_w, lens_h)
     R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
@@ -152,9 +153,7 @@ def load_rectification(cal_path, lens_w, lens_h):
     print(f"  Escala vs calibracion: sx={sx:.3f}  sy={sy:.3f}")
     if sx < 0.5:
         print("  AVISO  Resolucion baja vs calibracion - sube resolucion en server_2.py")
-        print("     para mejor calidad de disparidad.")
 
-    # P1[:3,:3] es la K exacta del lente izquierdo rectificado
     K_rect = P1[:3, :3].copy()
     return maps_izq, maps_der, Q, K_rect
 
@@ -182,12 +181,10 @@ def build_model_args():
 
 
 def load_raft_model():
-    """Carga RAFT-Stereo en GPU y retorna (model, args)."""
     args  = build_model_args()
     model = RAFTStereo(args)
 
     state = torch.load(str(RAFT_MODEL), map_location='cpu')
-    # Quitar prefijo 'module.' si el checkpoint viene de DataParallel
     clean_state = {k.replace('module.', ''): v for k, v in state.items()}
     model.load_state_dict(clean_state)
 
@@ -197,7 +194,6 @@ def load_raft_model():
 
 
 def pad32(img):
-    """Pad imagen para que H y W sean multiplos de 32 (requerido por RAFT)."""
     h, w   = img.shape[:2]
     pad_h  = (32 - h % 32) % 32
     pad_w  = (32 - w % 32) % 32
@@ -206,7 +202,6 @@ def pad32(img):
 
 
 def to_tensor(img_bgr):
-    """Convierte imagen BGR numpy -> tensor CUDA (1, 3, H, W) float."""
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     t   = torch.from_numpy(rgb).permute(2, 0, 1).float().unsqueeze(0)
     return t.cuda()
@@ -214,10 +209,6 @@ def to_tensor(img_bgr):
 
 @torch.no_grad()
 def run_raft(model, args, img_izq, img_der):
-    """
-    Calcula mapa de disparidad con RAFT-Stereo.
-    Retorna array numpy (H, W) con valores de disparidad en pixeles (>= 0).
-    """
     orig_h, orig_w = img_izq.shape[:2]
 
     izq_pad, h, w = pad32(img_izq)
@@ -228,14 +219,12 @@ def run_raft(model, args, img_izq, img_der):
 
     _, flow = model(t_izq, t_der, iters=args.valid_iters, test_mode=True)
 
-    # RAFT devuelve flujo izq->der (negativo), lo invertimos a disparidad positiva
     disp = -flow.squeeze().cpu().numpy()
     disp = np.clip(disp[:orig_h, :orig_w], 0, None)
     return disp
 
 
 def disp_to_color(disp):
-    """Convierte mapa de disparidad a imagen BGR coloreada (TURBO colormap)."""
     if disp.max() > 0:
         norm = (disp / disp.max() * 255).astype(np.uint8)
     else:
@@ -305,14 +294,14 @@ def save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color):
 
 
 # ==================================================================
-#  HILO DE INFERENCIA RAFT-Stereo
+#  HILO DE INFERENCIA RAFT-Stereo  (GPU)
 # ==================================================================
 
-def inference_worker(model, args, sess, vo):
+def inference_worker(model, args, sess):
     """
-    Corre en hilo separado.
-    Consume frames de infer_queue, ejecuta RAFT-Stereo y actualiza latest_disp.
-    El hilo de video no se bloquea esperando la GPU.
+    Consume frames de infer_queue, ejecuta RAFT-Stereo (GPU)
+    y encola el resultado en vo_queue para el hilo de VO (CPU).
+    No hace nada de VO aqui para no bloquear el GIL.
     """
     while not stop_event.is_set():
         try:
@@ -322,30 +311,60 @@ def inference_worker(model, args, sess, vo):
 
         idx, raw_bytes, frame, rect_izq, rect_der = item
         try:
-            # -- Disparidad RAFT-Stereo --------------------------------
+            # -- Disparidad RAFT-Stereo (GPU) -------------------------
             disp       = run_raft(model, args, rect_izq, rect_der)
             disp_color = disp_to_color(disp)
 
             with latest_disp['lock']:
                 latest_disp['img'] = disp_color.copy()
 
-            # -- Odometría Visual (Fase 3) -----------------------------
-            result = vo.update(rect_izq, disp)
-
-            if result is not None:
-                R, t = result
-                # t está en las mismas unidades que T de calibración (mm)
-                print(f"  [VO] frame {idx:05d} | "
-                      f"dx={t[0]:+7.1f}mm  dy={t[1]:+7.1f}mm  dz={t[2]:+7.1f}mm")
-
+            # -- Guardar frames --------------------------------------
             if SAVE_FRAMES:
                 save_frame(sess, idx, raw_bytes, frame,
                            rect_izq, rect_der, disp_color)
+
+            # -- Encolar para VO (CPU) --------------------------------
+            try:
+                vo_queue.put_nowait((idx, rect_izq, disp))
+            except queue.Full:
+                pass  # VO ocupado, descartamos este frame
 
         except Exception as e:
             print(f"  AVISO Error inferencia frame {idx}: {e}")
 
         infer_queue.task_done()
+
+
+# ==================================================================
+#  HILO DE ODOMETRIA VISUAL  (CPU)
+# ==================================================================
+
+def vo_worker(vo):
+    """
+    Corre en hilo separado del de RAFT.
+    Consume de vo_queue y ejecuta VO (ORB + solvePnPRansac) en CPU.
+    Al estar separado de inference_worker, no bloquea el video
+    aunque solvePnPRansac retenga el GIL.
+    """
+    while not stop_event.is_set():
+        try:
+            item = vo_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        idx, rect_izq, disp = item
+        try:
+            result = vo.update(rect_izq, disp)
+
+            if result is not None:
+                R, t = result
+                print(f"  [VO] frame {idx:05d} | "
+                      f"dx={t[0]:+7.1f}mm  dy={t[1]:+7.1f}mm  dz={t[2]:+7.1f}mm")
+
+        except Exception as e:
+            print(f"  AVISO Error VO frame {idx}: {e}")
+
+        vo_queue.task_done()
 
 
 # ==================================================================
@@ -371,7 +390,6 @@ def request_shutdown():
 
 
 def handle_commands(cmd_sock):
-    """Hilo que lee teclado y manda comandos al carrito."""
     global command_socket
     old_settings = None
     fd = None
@@ -429,12 +447,6 @@ def handle_commands(cmd_sock):
 # ==================================================================
 
 def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
-    """
-    Recibe frames del servidor, aplica rectificacion y los encola
-    para que el hilo de inferencia calcule la disparidad.
-    Muestra en tiempo real: lente izq rectificado, lente der rectificado
-    y el ultimo mapa de disparidad disponible.
-    """
     map1_izq, map2_izq = maps_izq
     map1_der, map2_der = maps_der
     frame_index = 0
@@ -449,27 +461,23 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
         rect_izq = cv2.remap(raw_izq, map1_izq, map2_izq, cv2.INTER_LINEAR)
         rect_der = cv2.remap(raw_der, map1_der, map2_der, cv2.INTER_LINEAR)
 
-        # Mostrar frames rectificados
         cv2.imshow('Izquierdo rectificado', rect_izq)
         cv2.imshow('Derecho rectificado',   rect_der)
 
-        # Mostrar ultimo mapa de disparidad disponible (no bloquea)
         with latest_disp['lock']:
             if latest_disp['img'] is not None:
                 cv2.imshow('Disparidad RAFT-Stereo', latest_disp['img'])
 
-        # Encolar para inferencia - si la GPU no alcanza, descartamos el frame
         try:
             infer_queue.put_nowait(
                 (frame_index, frame_data, frame, rect_izq, rect_der)
             )
         except queue.Full:
-            pass  # GPU ocupada, frame descartado, continuamos sin bloquear
+            pass
 
         frame_index += 1
 
     try:
-        # El primer frame ya fue leido en main() para detectar resolucion
         if first_frame is not None:
             frame, frame_data = first_frame
             if frame is not None:
@@ -510,8 +518,6 @@ def main():
     model, args = load_raft_model()
 
     # -- 2. Conectar al servidor ----------------------------------
-    # El servidor acepta: primero comandos (9999), luego video (9998)
-    # El cliente debe conectar en ese mismo orden
     print(f"\n[2/4] Conectando a Pi ({PI_IP})...")
     cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     cmd_sock.connect((PI_IP, 9999))
@@ -530,33 +536,42 @@ def main():
         vid_sock.close()
         return
 
-    h, w       = first_frame.shape[:2]
-    lens_w     = w // 2
-    lens_h     = h
+    h, w   = first_frame.shape[:2]
+    lens_w = w // 2
+    lens_h = h
 
     # -- 4. Calcular mapas de rectificacion -----------------------
     print("\n[4/4] Calculando mapas de rectificacion estereo...")
-    maps_izq, maps_der, Q , K_rect = load_rectification(CAL_JSON, lens_w, lens_h)
+    maps_izq, maps_der, Q, K_rect = load_rectification(CAL_JSON, lens_w, lens_h)
     print("  OK Mapas listos")
 
-    # -- Instanciar odometría visual ----------------------------------
+    # -- Instanciar odometria visual ------------------------------
     vo = VisualOdometry(Q, K_rect)
     print("  OK VisualOdometry lista")
 
-    # -- Crear sesion de captura -----------------------------------
+    # -- Crear sesion de captura ----------------------------------
     print("\nCreando sesion de captura...")
     sess = create_session() if SAVE_FRAMES else None
 
-    # -- Hilo de inferencia RAFT-Stereo ----------------------------
+    # -- Hilo RAFT-Stereo (GPU) -----------------------------------
     t_infer = threading.Thread(
         target=inference_worker,
-        args=(model, args, sess, vo),
+        args=(model, args, sess),
         daemon=True,
-        name='RAFT-Inference',
+        name='RAFT-GPU',
     )
     t_infer.start()
 
-    # -- Hilo de comandos ------------------------------------------
+    # -- Hilo Odometria Visual (CPU) ------------------------------
+    t_vo = threading.Thread(
+        target=vo_worker,
+        args=(vo,),
+        daemon=True,
+        name='VO-CPU',
+    )
+    t_vo.start()
+
+    # -- Hilo de comandos -----------------------------------------
     t_cmd = threading.Thread(
         target=handle_commands,
         args=(cmd_sock,),
@@ -565,7 +580,8 @@ def main():
     )
     t_cmd.start()
 
-    print("\n> Stream iniciado.\n")
+    print("\n> Stream iniciado.")
+    print("> Arquitectura: video -> RAFT(GPU) -> VO(CPU)\n")
 
     # -- Loop de video en hilo principal --------------------------
     try:
@@ -576,6 +592,7 @@ def main():
     finally:
         stop_event.set()
         t_infer.join(timeout=5)
+        t_vo.join(timeout=5)
         close_session(sess)
         try:
             cmd_sock.close()
