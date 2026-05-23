@@ -24,6 +24,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+from visual_odometry import VisualOdometry  # clase ORB-SLAM2-like para comparar con RAFT-Stereo
 
 if os.name == 'nt':
     import msvcrt
@@ -153,7 +154,9 @@ def load_rectification(cal_path, lens_w, lens_h):
         print("  AVISO  Resolucion baja vs calibracion - sube resolucion en server_2.py")
         print("     para mejor calidad de disparidad.")
 
-    return maps_izq, maps_der, Q
+    # P1[:3,:3] es la K exacta del lente izquierdo rectificado
+    K_rect = P1[:3, :3].copy()
+    return maps_izq, maps_der, Q, K_rect
 
 
 # ==================================================================
@@ -305,7 +308,7 @@ def save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color):
 #  HILO DE INFERENCIA RAFT-Stereo
 # ==================================================================
 
-def inference_worker(model, args, sess):
+def inference_worker(model, args, sess, vo):
     """
     Corre en hilo separado.
     Consume frames de infer_queue, ejecuta RAFT-Stereo y actualiza latest_disp.
@@ -319,11 +322,21 @@ def inference_worker(model, args, sess):
 
         idx, raw_bytes, frame, rect_izq, rect_der = item
         try:
+            # -- Disparidad RAFT-Stereo --------------------------------
             disp       = run_raft(model, args, rect_izq, rect_der)
             disp_color = disp_to_color(disp)
 
             with latest_disp['lock']:
                 latest_disp['img'] = disp_color.copy()
+
+            # -- Odometría Visual (Fase 3) -----------------------------
+            result = vo.update(rect_izq, disp)
+
+            if result is not None:
+                R, t = result
+                # t está en las mismas unidades que T de calibración (mm)
+                print(f"  [VO] frame {idx:05d} | "
+                      f"dx={t[0]:+7.1f}mm  dy={t[1]:+7.1f}mm  dz={t[2]:+7.1f}mm")
 
             if SAVE_FRAMES:
                 save_frame(sess, idx, raw_bytes, frame,
@@ -523,17 +536,21 @@ def main():
 
     # -- 4. Calcular mapas de rectificacion -----------------------
     print("\n[4/4] Calculando mapas de rectificacion estereo...")
-    maps_izq, maps_der, Q = load_rectification(CAL_JSON, lens_w, lens_h)
+    maps_izq, maps_der, Q , K_rect = load_rectification(CAL_JSON, lens_w, lens_h)
     print("  OK Mapas listos")
+
+    # -- Instanciar odometría visual ----------------------------------
+    vo = VisualOdometry(Q, K_rect)
+    print("  OK VisualOdometry lista")
 
     # -- Crear sesion de captura -----------------------------------
     print("\nCreando sesion de captura...")
     sess = create_session() if SAVE_FRAMES else None
 
     # -- Hilo de inferencia RAFT-Stereo ----------------------------
-    t_infer = threadingz.Thread(
+    t_infer = threading.Thread(
         target=inference_worker,
-        args=(model, args, sess),
+        args=(model, args, sess, vo),
         daemon=True,
         name='RAFT-Inference',
     )
