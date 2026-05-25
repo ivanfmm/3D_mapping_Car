@@ -8,8 +8,8 @@ from motor import Ordinary_Car
 car = Ordinary_Car()
 stop_event = threading.Event()
 
-WIDTH, HEIGHT = 2560, 720
-FPS = 60
+WIDTH, HEIGHT = 1280, 720
+FPS = 30
 
 COMMANDS = {
     'w': (600, 600, 600, 600),
