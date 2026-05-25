@@ -570,7 +570,6 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
 # ==================================================================
 #  GENERACION DE NUBE DE PUNTOS  (fase post-sesion)
 # ==================================================================
-
 def build_point_cloud(sess, vo, Q):
     """
     Post-sesion: proyecta disparidades guardadas a 3D con poses optimizadas,
@@ -665,12 +664,7 @@ def build_point_cloud(sess, vo, Q):
 
         # -- Filtrar por confianza y rango de profundidad -------------
         z    = pts3d[:, :, 2]
-        mask = (
-            (disp > DISP_MIN) &
-            np.isfinite(z)    &
-            (z > Z_MIN)       &
-            (z < Z_MAX)
-        )
+        mask = ((disp > DISP_MIN) & np.isfinite(z) & (z > Z_MIN) & (z < Z_MAX))
 
         pts  = pts3d[mask].astype(np.float64)
         cols = img[mask][:, ::-1].astype(np.float64) / 255.0
@@ -682,6 +676,11 @@ def build_point_cloud(sess, vo, Q):
         T_pose = poses[frame_idx]
         pts_h  = np.hstack([pts, np.ones((len(pts), 1))])
         pts_w  = (T_pose @ pts_h.T).T[:, :3]
+
+        # -- Filtrar puntos detrás del plano mundo (Z negativo) -------
+        valid_w = pts_w[:, 2] > 0
+        pts_w   = pts_w[valid_w]
+        cols    = cols[valid_w]
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts_w)
@@ -934,14 +933,11 @@ def main():
                 disp_img = latest_disp['img']
 
             if izq is not None:
-                cv2.imshow('Izquierdo rectificado',
-                           cv2.resize(izq, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
+                cv2.imshow('Izquierdo rectificado', cv2.resize(izq, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
             if der is not None:
-                cv2.imshow('Derecho rectificado',
-                           cv2.resize(der, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
+                cv2.imshow('Derecho rectificado', cv2.resize(der, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
             if disp_img is not None:
-                cv2.imshow('Disparidad RAFT-Stereo',
-                           cv2.resize(disp_img, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
+                cv2.imshow('Disparidad RAFT-Stereo', cv2.resize(disp_img, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
 
             key = cv2.waitKey(33) & 0xFF  # ~30 fps
             if key == ord('x'):

@@ -24,9 +24,9 @@ from scipy.optimize import minimize
 # ==================================================================
 #  Constantes de loop closure y PGO
 # ==================================================================
-MIN_LOOP_SEP      = 15    # frames minimos de separacion para loop closure
-MIN_LOOP_VOTES    = 12    # votos FAISS minimos para considerar candidato
-MIN_LOOP_INLIERS  = 8     # inliers PnP para verificacion geometrica de loop
+MIN_LOOP_SEP      = 10    # frames minimos de separacion para loop closure \eran 15
+MIN_LOOP_VOTES    = 8    # votos FAISS minimos para considerar candidato \era 12
+MIN_LOOP_INLIERS  = 6     # inliers PnP para verificacion geometrica de loop \era 8
 LOOP_CHECK_EVERY  = 1     # buscar loop closure en CADA frame
 LOOP_PGO_COOLDOWN = 30    # frames minimos entre corridas consecutivas de PGO
 PGO_WEIGHT_LOOP   = 5.0   # peso de edges de loop vs edges secuenciales
@@ -45,7 +45,7 @@ MIN_PNP_MATCHES = 12      # matches minimos tras ratio test para intentar PnP
 MIN_PNP_INLIERS = 12      # inliers minimos para aceptar resultado de PnP
 
 # Loop closure - filtro de calidad FAISS
-LC_HAMMING_MAX  = 64      # distancia Hamming maxima para contar voto valido
+LC_HAMMING_MAX  = 80      # distancia Hamming maxima para contar voto valido \ era 64
 
 # ICP frame a frame
 ICP_MAX_DIST  = 100.0   # mm - distancia maxima de correspondencia
