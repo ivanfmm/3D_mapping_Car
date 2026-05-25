@@ -1,21 +1,18 @@
 """
-client_3.py - Cliente estereo con rectificacion + RAFT-Stereo en GPU
-=====================================================================
-Flujo por frame:
-  raw frame  ->  split izq/der  ->  remap (rectificacion)
-             ->  RAFT-Stereo GPU  ->  mapa de disparidad  ->  vo_worker CPU
-             ->  mostrar + guardar (frames rectificados + disparidad)
+client_3.py - Cliente estereo con SLAM offline
+===============================================
+Flujo en dos fases:
 
-Arquitectura de hilos:
-  video_loop (hilo)  -> infer_queue -> inference_worker (GPU)
-                                    -> vo_queue          -> vo_worker (CPU)
-  hilo principal     -> GUI loop (imshow / waitKey) a ~30fps
+FASE 1 - Captura (en vivo):
+  video_loop (hilo) -> rectifica -> save_queue -> save_worker (disco)
+  hilo principal    -> GUI loop (imshow / waitKey)
+  hilo comandos     -> WASD -> carrito
 
-Controles: W/A/S/D = mover carrito | Q = frenar | X = salir
+FASE 2 - SLAM offline (al cerrar):
+  lector_disco -> raft_queue -> RAFT GPU -> vo_queue -> VO CPU
+  build_point_cloud -> mapa_final.ply + mapa_paredes.ply
 
-FIXES aplicados:
-  - run_raft: squeeze defensivo + assert 2D antes de retornar disp
-  - _deproject en VisualOdometry: squeeze al recibir disp
+Controles: W/A/S/D = mover carrito | Q = frenar | X = salir y procesar
 """
 
 import socket
@@ -43,7 +40,7 @@ else:
     import termios
 
 # ==================================================================
-#  CONFIGURACION - ajusta paths si cambias de maquina
+#  CONFIGURACION
 # ==================================================================
 PI_IP          = '10.42.0.146'
 CAL_JSON       = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/parac/estereo_cal.json')
@@ -52,8 +49,8 @@ RAFT_MODEL     = RAFT_DIR / 'models/raftstereo-middlebury.pth'
 SAVE_ROOT      = Path('captured_frames')
 SAVE_FRAMES    = True
 MAX_FRAME_SIZE = 50 * 1024 * 1024
-INFER_ITERS    = 10   # iteraciones RAFT (mas = mas calidad, mas lento)
-PREVIEW_SCALE  = 0.5  # escala del preview (1.0 = sin escala)
+INFER_ITERS    = 20   # offline: podemos usar mas iteraciones
+PREVIEW_SCALE  = 0.5
 
 # -- RAFT-Stereo path setup ----------------------------------------
 sys.path.insert(0, str(RAFT_DIR))
@@ -64,10 +61,7 @@ from raft_stereo import RAFTStereo
 stop_event     = threading.Event()
 command_socket = None
 command_lock   = threading.Lock()
-infer_queue    = queue.Queue(maxsize=2)   # video -> RAFT (GPU)
-vo_queue       = queue.Queue(maxsize=2)   # RAFT  -> VO   (CPU)
-save_queue     = queue.Queue(maxsize=10)  # RAFT  -> disk (hilo I/O)
-latest_disp    = {'img': None, 'lock': threading.Lock()}
+save_queue     = queue.Queue(maxsize=30)  # video -> disco
 latest_preview = {'izq': None, 'der': None, 'lock': threading.Lock()}
 
 
@@ -76,7 +70,6 @@ latest_preview = {'izq': None, 'der': None, 'lock': threading.Lock()}
 # ==================================================================
 
 def recv_exact(sock, size):
-    """Lee exactamente `size` bytes del socket."""
     buf  = bytearray(size)
     view = memoryview(buf)
     pos  = 0
@@ -92,10 +85,6 @@ def recv_exact(sock, size):
 
 
 def read_one_frame(sock):
-    """
-    Lee un frame completo del socket de video.
-    Retorna (frame_bgr, frame_bytes) o (None, None) si hay error.
-    """
     payload_size = struct.calcsize('<L')
     packed = recv_exact(sock, payload_size)
     if packed is None:
@@ -119,16 +108,6 @@ def read_one_frame(sock):
 # ==================================================================
 
 def load_rectification(cal_path, lens_w, lens_h):
-    """
-    Carga el JSON de calibracion y calcula los mapas de rectificacion
-    escalados a la resolucion real del stream.
-
-    Retorna:
-      maps_izq  - (map1, map2) para cv2.remap del lente izquierdo
-      maps_der  - (map1, map2) para cv2.remap del lente derecho
-      Q         - matriz de reproyeccion disparidad->3D
-      K_rect    - matriz K exacta del lente izquierdo rectificado (P1[:3,:3])
-    """
     with open(cal_path) as f:
         cal = json.load(f)
 
@@ -138,18 +117,16 @@ def load_rectification(cal_path, lens_w, lens_h):
 
     def scale_K(K_list):
         K = np.array(K_list, dtype=np.float64)
-        K[0, 0] *= sx
-        K[1, 1] *= sy
-        K[0, 2] *= sx
-        K[1, 2] *= sy
+        K[0, 0] *= sx;  K[1, 1] *= sy
+        K[0, 2] *= sx;  K[1, 2] *= sy
         return K
 
-    K_izq  = scale_K(cal['lente_izquierdo']['matriz_camara'])
-    D_izq  = np.array(cal['lente_izquierdo']['coef_distorsion'], dtype=np.float64)
-    K_der  = scale_K(cal['lente_derecho']['matriz_camara'])
-    D_der  = np.array(cal['lente_derecho']['coef_distorsion'], dtype=np.float64)
-    R      = np.array(cal['estereo']['R'], dtype=np.float64)
-    T      = np.array(cal['estereo']['T'], dtype=np.float64)
+    K_izq = scale_K(cal['lente_izquierdo']['matriz_camara'])
+    D_izq = np.array(cal['lente_izquierdo']['coef_distorsion'], dtype=np.float64)
+    K_der = scale_K(cal['lente_derecho']['matriz_camara'])
+    D_der = np.array(cal['lente_derecho']['coef_distorsion'], dtype=np.float64)
+    R     = np.array(cal['estereo']['R'], dtype=np.float64)
+    T     = np.array(cal['estereo']['T'], dtype=np.float64)
 
     size = (lens_w, lens_h)
     R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
@@ -162,7 +139,7 @@ def load_rectification(cal_path, lens_w, lens_h):
     print(f"  Resolucion por lente: {lens_w}x{lens_h}")
     print(f"  Escala vs calibracion: sx={sx:.3f}  sy={sy:.3f}")
     if sx < 0.5:
-        print("  AVISO  Resolucion baja vs calibracion - sube resolucion en server_2.py")
+        print("  AVISO  Resolucion baja vs calibracion")
 
     K_rect = P1[:3, :3].copy()
     return maps_izq, maps_der, Q, K_rect
@@ -193,11 +170,9 @@ def build_model_args():
 def load_raft_model():
     args  = build_model_args()
     model = RAFTStereo(args)
-
     state = torch.load(str(RAFT_MODEL), map_location='cpu')
     clean_state = {k.replace('module.', ''): v for k, v in state.items()}
     model.load_state_dict(clean_state)
-
     model = model.cuda().eval()
     print(f"  GPU: {torch.cuda.get_device_name(0)}")
     return model, args
@@ -207,47 +182,33 @@ def pad32(img):
     h, w   = img.shape[:2]
     pad_h  = (32 - h % 32) % 32
     pad_w  = (32 - w % 32) % 32
-    padded = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-    return padded, h, w
+    return cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT), h, w
 
 
 def to_tensor(img_bgr):
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    t   = torch.from_numpy(rgb).permute(2, 0, 1).float().unsqueeze(0)
-    return t.cuda()
+    return torch.from_numpy(rgb).permute(2, 0, 1).float().unsqueeze(0).cuda()
 
 
 @torch.no_grad()
 def run_raft(model, args, img_izq, img_der):
     orig_h, orig_w = img_izq.shape[:2]
+    izq_pad, _, _  = pad32(img_izq)
+    der_pad, _, _  = pad32(img_der)
 
-    izq_pad, h, w = pad32(img_izq)
-    der_pad, _, _ = pad32(img_der)
+    _, flow = model(to_tensor(izq_pad), to_tensor(der_pad),
+                    iters=args.valid_iters, test_mode=True)
 
-    t_izq = to_tensor(izq_pad)
-    t_der = to_tensor(der_pad)
-
-    _, flow = model(t_izq, t_der, iters=args.valid_iters, test_mode=True)
-
-    # Squeeze completo en GPU, luego crop y clamp
     flow_sq = flow.squeeze()
-
-    # Asegurar que sea 2D (H, W) — RAFT a veces deja dims extra
     if flow_sq.ndim == 1:
-        # Caso degenrado: reshape usando las dimensiones originales
         flow_sq = flow_sq.reshape(orig_h, orig_w)
     elif flow_sq.ndim > 2:
         flow_sq = flow_sq[0]
 
     disp = (-flow_sq[:orig_h, :orig_w]).clamp(min=0).cpu().numpy()
 
-    # Garantia final antes de salir de esta funcion
     if disp.ndim != 2:
-        raise RuntimeError(
-            f"run_raft: disp debe ser 2D pero tiene shape {disp.shape}. "
-            f"flow original shape={flow.shape}"
-        )
-
+        raise RuntimeError(f"run_raft: disp shape inesperado {disp.shape}")
     return disp
 
 
@@ -264,9 +225,9 @@ def disp_to_color(disp):
 # ==================================================================
 
 def create_session():
-    ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-    sd   = SAVE_ROOT / f'session_{ts}'
-    dirs = {k: sd / k for k in ('full', 'left_rect', 'right_rect', 'disparity', 'disparity_raw')}
+    ts  = datetime.now().strftime('%Y%m%d_%H%M%S')
+    sd  = SAVE_ROOT / f'session_{ts}'
+    dirs = {k: sd / k for k in ('full', 'left_rect', 'right_rect')}
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
@@ -276,7 +237,6 @@ def create_session():
         'frame_index', 'timestamp_unix', 'timestamp_iso',
         'width', 'height',
         'full_path', 'left_rect_path', 'right_rect_path',
-        'disparity_path', 'disparity_raw_path',
     ])
 
     print(f"  Sesion: {sd.resolve()}")
@@ -294,43 +254,35 @@ def close_session(sess):
 
 
 # ==================================================================
-#  HILO DE GUARDADO EN DISCO  (I/O)
+#  HILO DE GUARDADO EN DISCO (Fase 1 - solo frames, sin RAFT)
 # ==================================================================
 
 def save_worker(sess):
-    """
-    Consume de save_queue y escribe frames/CSV a disco.
-    Al correr en hilo separado, el hilo GPU nunca bloquea por I/O.
-    """
     while not stop_event.is_set():
         try:
             item = save_queue.get(timeout=0.5)
         except queue.Empty:
             continue
-
-        idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp_raw = item
         try:
-            save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp_raw)
+            _save_frame(sess, *item)
         except Exception as e:
-            print(f"  AVISO Error guardado frame {idx}: {e}")
-
+            print(f"  AVISO Error guardado frame {item[0]}: {e}")
         save_queue.task_done()
 
-    # Vaciar lo que quede en la cola al cerrar
+    # Vaciar cola al cerrar
     while not save_queue.empty():
         try:
             item = save_queue.get_nowait()
         except queue.Empty:
             break
-        idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp_raw = item
         try:
-            save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp_raw)
+            _save_frame(sess, *item)
         except Exception:
             pass
         save_queue.task_done()
 
 
-def save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp_raw):
+def _save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der):
     if sess is None:
         return
 
@@ -339,22 +291,18 @@ def save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp
     h, w = frame.shape[:2]
     d    = sess['dirs']
 
-    p_full     = d['full']          / f'frame_{idx:06d}.jpg'
-    p_izq      = d['left_rect']     / f'left_{idx:06d}.jpg'
-    p_der      = d['right_rect']    / f'right_{idx:06d}.jpg'
-    p_disp     = d['disparity']     / f'disp_{idx:06d}.jpg'
-    p_disp_raw = d['disparity_raw'] / f'disp_{idx:06d}.npy'
+    p_full = d['full']       / f'frame_{idx:06d}.jpg'
+    p_izq  = d['left_rect']  / f'left_{idx:06d}.jpg'
+    p_der  = d['right_rect'] / f'right_{idx:06d}.jpg'
 
     with open(p_full, 'wb') as f:
         f.write(raw_bytes)
     cv2.imwrite(str(p_izq),  rect_izq)
     cv2.imwrite(str(p_der),  rect_der)
-    cv2.imwrite(str(p_disp), disp_color)
-    np.save(str(p_disp_raw), disp_raw)
 
     sess['writer'].writerow([
         idx, f'{now:.6f}', ts, w, h,
-        str(p_full), str(p_izq), str(p_der), str(p_disp), str(p_disp_raw),
+        str(p_full), str(p_izq), str(p_der),
     ])
     if idx % 30 == 0:
         sess['csv'].flush()
@@ -391,7 +339,7 @@ def handle_commands(cmd_sock):
         with command_lock:
             command_socket = cmd_sock
 
-        print("    W/A/S/D = mover | Q = frenar | X = salir")
+        print("    W/A/S/D = mover | Q = frenar | X = salir y procesar")
 
         if os.name != 'nt':
             fd = sys.stdin.fileno()
@@ -436,7 +384,7 @@ def handle_commands(cmd_sock):
 
 
 # ==================================================================
-#  LOOP DE VIDEO
+#  LOOP DE VIDEO (Fase 1 - captura y rectifica, guarda directo)
 # ==================================================================
 
 def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
@@ -454,17 +402,19 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
         rect_izq = cv2.remap(raw_izq, map1_izq, map2_izq, cv2.INTER_LINEAR)
         rect_der = cv2.remap(raw_der, map1_der, map2_der, cv2.INTER_LINEAR)
 
-        # Guardar para el hilo de preview (sin bloquear aqui)
+        # Actualizar preview para GUI
         with latest_preview['lock']:
-            latest_preview['izq'] = rect_izq
-            latest_preview['der'] = rect_der
+            latest_preview['izq'] = rect_izq.copy()
+            latest_preview['der'] = rect_der.copy()
 
-        try:
-            infer_queue.put_nowait(
-                (frame_index, frame_data, frame, rect_izq, rect_der)
-            )
-        except queue.Full:
-            pass
+        # Guardar directamente en disco (sin RAFT en esta fase)
+        if SAVE_FRAMES:
+            try:
+                save_queue.put_nowait(
+                    (frame_index, bytes(frame_data), frame, rect_izq, rect_der)
+                )
+            except queue.Full:
+                pass
 
         frame_index += 1
 
@@ -479,7 +429,6 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
             if frame is None:
                 print("  Conexion de video cerrada")
                 break
-
             process(frame, frame_data)
 
     except Exception as e:
@@ -489,21 +438,14 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
         request_shutdown()
         print(f"  Frames recibidos: {frame_index}")
 
+
 # ==================================================================
-#  SLAM OFFLINE  (Fase 2: RAFT + VO sobre frames guardados)
+#  SLAM OFFLINE (Fase 2 - RAFT + VO sobre frames guardados)
 # ==================================================================
 
 def slam_offline(sess, model, args, Q, K_rect):
-    """
-    Procesa TODOS los frames guardados en disco en dos hilos en pipeline:
-      lector_disco  ->  raft_queue  ->  raft_worker (GPU)
-                                    ->  vo_queue    ->  vo_worker (CPU)
-
-    Al terminar retorna el objeto VisualOdometry con todas las poses
-    para que build_point_cloud() las use.
-    """
     if sess is None or not SAVE_FRAMES:
-        print("  [SLAM] Sin sesion de captura, saltando SLAM offline.")
+        print("  [SLAM] Sin sesion de captura.")
         return None
 
     sd       = sess['sd']
@@ -511,13 +453,12 @@ def slam_offline(sess, model, args, Q, K_rect):
     rder_dir = sd / 'right_rect'
 
     left_files = sorted(left_dir.glob('left_*.jpg'))
-    rder_files = sorted(rder_dir.glob('right_*.jpg'))
 
     if not left_files:
         print("  [SLAM] No se encontraron frames en disco.")
+        print(f"         Buscando en: {left_dir.resolve()}")
         return None
 
-    # Parear izq/der por nombre de frame
     pairs = []
     for lp in left_files:
         idx_str = lp.stem.replace('left_', '')
@@ -527,52 +468,51 @@ def slam_offline(sess, model, args, Q, K_rect):
 
     n_total = len(pairs)
     print(f"\n{'='*58}")
-    print(f"  SLAM OFFLINE — {n_total} frames a procesar")
+    print(f"  SLAM OFFLINE — {n_total} pares de frames")
     print(f"{'='*58}")
 
-    raft_queue_off = queue.Queue(maxsize=4)   # lector  -> RAFT
-    vo_queue_off   = queue.Queue(maxsize=4)   # RAFT    -> VO
-    slam_stop      = threading.Event()
+    # Crear carpeta disparity_raw
+    disp_raw_dir = sd / 'disparity_raw'
+    disp_raw_dir.mkdir(exist_ok=True)
 
-    vo = VisualOdometry(Q, K_rect)
+    raft_queue_off = queue.Queue(maxsize=4)
+    vo_queue_off   = queue.Queue(maxsize=4)
+    vo             = VisualOdometry(Q, K_rect)
 
-    # -- Hilo lector: lee jpgs del disco y los encola ---------------
     def lector_worker():
         for frame_idx, lp, rp in pairs:
-            if slam_stop.is_set():
-                break
             izq = cv2.imread(str(lp))
             der = cv2.imread(str(rp))
             if izq is None or der is None:
                 continue
             raft_queue_off.put((frame_idx, izq, der))
-        raft_queue_off.put(None)   # sentinel
+        raft_queue_off.put(None)
 
-    # -- Hilo RAFT: GPU sin límite de tiempo -------------------------
     def raft_worker():
         processed = 0
-        while not slam_stop.is_set():
+        while True:
             item = raft_queue_off.get()
             if item is None:
-                vo_queue_off.put(None)   # propagar sentinel
+                vo_queue_off.put(None)
                 break
             frame_idx, izq, der = item
             try:
                 disp = run_raft(model, args, izq, der)
+                np.save(str(disp_raw_dir / f'disp_{frame_idx:06d}.npy'), disp)
                 vo_queue_off.put((frame_idx, izq, disp))
                 processed += 1
                 if processed % 20 == 0:
-                    print(f"  [RAFT] {processed}/{n_total} frames procesados...")
+                    pct = 100 * processed / n_total
+                    print(f"  [RAFT] {processed}/{n_total} ({pct:.0f}%)...")
             except Exception as e:
                 print(f"  AVISO RAFT frame {frame_idx}: {e}")
 
-    # -- Hilo VO: CPU, procesa todos los frames ----------------------
     vo_done = threading.Event()
     validos = [0]
     total   = [0]
 
     def vo_worker_off():
-        while not slam_stop.is_set():
+        while True:
             item = vo_queue_off.get()
             if item is None:
                 break
@@ -586,12 +526,11 @@ def slam_offline(sess, model, args, Q, K_rect):
                         R, t = result
                         print(f"  [VO]  frame {frame_idx:05d} | "
                               f"dx={t[0]:+7.1f}  dy={t[1]:+7.1f}  dz={t[2]:+7.1f} mm"
-                              f"  ({validos[0]}/{total[0]} válidos)")
+                              f"  ({validos[0]}/{total[0]} validos)")
             except Exception as e:
                 print(f"  AVISO VO frame {frame_idx}: {e}")
         vo_done.set()
 
-    # -- Lanzar los tres hilos en pipeline --------------------------
     t_lector = threading.Thread(target=lector_worker, daemon=True, name='Lector')
     t_raft   = threading.Thread(target=raft_worker,   daemon=True, name='RAFT-off')
     t_vo     = threading.Thread(target=vo_worker_off, daemon=True, name='VO-off')
@@ -604,48 +543,42 @@ def slam_offline(sess, model, args, Q, K_rect):
     t_raft.join()
     vo_done.wait()
 
-    print(f"\n  [SLAM] Offline completo: {validos[0]}/{total[0]} frames con pose válida")
+    print(f"\n  [SLAM] Completo: {validos[0]}/{total[0]} frames con pose valida")
     if total[0] > 0:
         pct = 100 * validos[0] / total[0]
         print(f"  [SLAM] Cobertura: {pct:.1f}%"
-              + (" — buena" if pct > 60 else " — baja, revisa velocidad del carrito"))
+              + (" — buena" if pct > 60 else " — baja"))
 
     return vo
 
 
-
-
 # ==================================================================
-#BUILD POINT CLOUD DESDE POSES + DISPARIDAD
+#  BUILD POINT CLOUD (Fase 3)
 # ==================================================================
+
 def build_point_cloud(sess, vo, Q):
-    """
-    Post-sesion: proyecta disparidades guardadas a 3D con poses optimizadas,
-    verifica unidades, exporta trayectoria, aplica ICP entre frames consecutivos
-    con gate de fitness, y exporta mapa_final.ply.
-    """
     try:
         import open3d as o3d
     except ImportError:
-        print("  [PC] open3d no disponible - instala con: pip install open3d")
+        print("  [PC] open3d no disponible - pip install open3d")
         return
 
     if sess is None or not SAVE_FRAMES:
         return
 
-    # -- Parametros (distancias en mm) --------------------------------
-    DISP_MIN      = 2.0     # disparidad minima de confianza
-    Z_MIN         = 100.0   # profundidad minima (mm)
-    Z_MAX         = 8000.0  # profundidad maxima (mm)
-    VOXEL_SIZE    = 20.0    # voxel por frame y final (mm)
-    STAT_K        = 20      # vecinos para outlier estadistico por frame
-    STAT_STD      = 2.0     # umbral sigma por frame
-    RAD_POINTS    = 16      # vecinos minimos outlier radial final
-    RAD_RADIUS    = 50.0    # radio outlier radial final (mm)
-    ICP_MAX_DIST  = 100.0   # distancia maxima de correspondencia ICP (mm)
-    ICP_MIN_FIT   = 0.15    # fitness minimo — descartar frame si es menor
-    ICP_MAX_ITER  = 30      # iteraciones maximas ICP
-    FRAME_STRIDE  = 2       # usar 1 de cada N frames
+    DISP_MIN     = 2.0
+    Z_MIN        = 100.0
+    Z_MAX        = 8000.0
+    VOXEL_SIZE   = 20.0
+    STAT_K       = 20
+    STAT_STD     = 2.0
+    RAD_POINTS   = 16
+    RAD_RADIUS   = 50.0
+    ICP_MAX_DIST = 100.0
+    ICP_MIN_FIT  = 0.15
+    ICP_MAX_ITER = 30
+    FRAME_STRIDE = 2
+    MIN_POSE_MOV = 5.0
 
     sd       = sess['sd']
     raw_dir  = sd / 'disparity_raw'
@@ -656,7 +589,7 @@ def build_point_cloud(sess, vo, Q):
         print("  [PC] Sin poses disponibles")
         return
 
-    # -- 1. Exportar trayectoria poses.txt ----------------------------
+    # Exportar trayectoria
     poses_path = sd / 'poses.txt'
     with open(str(poses_path), 'w') as f:
         f.write("frame_idx  X_mm        Y_mm        Z_mm\n")
@@ -667,16 +600,15 @@ def build_point_cloud(sess, vo, Q):
 
     all_frame_ids = sorted(poses.keys())
     frame_ids     = all_frame_ids[::FRAME_STRIDE]
-    print(f"\n[PC] Sesion: {len(all_frame_ids)} frames totales -> "
-          f"{len(frame_ids)} a procesar (stride={FRAME_STRIDE})...")
+    print(f"\n  [PC] Generando nube ({len(frame_ids)} frames, stride={FRAME_STRIDE})...")
 
-    pcd_combined  = o3d.geometry.PointCloud()
-    prev_pcd      = None
-    prev_pos      = None   # traslacion del ultimo frame aceptado
-    processed     = 0
-    skipped       = 0
-    skipped_pose  = 0
-    first_done    = False
+    pcd_combined = o3d.geometry.PointCloud()
+    prev_pcd     = None
+    prev_pos     = None
+    processed    = 0
+    skipped_icp  = 0
+    skipped_pose = 0
+    first_done   = False
 
     for frame_idx in frame_ids:
         disp_path = raw_dir  / f'disp_{frame_idx:06d}.npy'
@@ -690,29 +622,26 @@ def build_point_cloud(sess, vo, Q):
         if img is None:
             continue
 
-        # -- 1b. Saltar frame si la pose no se movio >= 5mm -----------
         cur_pos = poses[frame_idx][:3, 3]
         if prev_pos is not None:
-            if np.linalg.norm(cur_pos - prev_pos) < 5.0:
+            if np.linalg.norm(cur_pos - prev_pos) < MIN_POSE_MOV:
                 skipped_pose += 1
                 continue
 
-        pts3d = cv2.reprojectImageTo3D(disp, Q)   # (H, W, 3) en coords camara
+        pts3d = cv2.reprojectImageTo3D(disp, Q)
 
-        # -- 2. Verificacion de unidades en el primer frame -----------
         if not first_done:
             z_all  = pts3d[:, :, 2]
             vmask  = (disp > DISP_MIN) & np.isfinite(z_all) & (z_all > 0)
             sample = pts3d[vmask][:10]
             print(f"  [PC] Q:\n{np.array2string(Q, precision=4, suppress_small=True)}")
-            print("  [PC] Primeros 10 puntos 3D validos (verifica unidades Z):")
+            print("  [PC] Primeros 10 puntos 3D validos:")
             for p in sample:
                 print(f"       X={p[0]:8.1f}  Y={p[1]:8.1f}  Z={p[2]:8.1f}")
             first_done = True
 
-        # -- Filtrar por confianza y rango de profundidad -------------
         z    = pts3d[:, :, 2]
-        mask = ((disp > DISP_MIN) & np.isfinite(z) & (z > Z_MIN) & (z < Z_MAX))
+        mask = (disp > DISP_MIN) & np.isfinite(z) & (z > Z_MIN) & (z < Z_MAX)
 
         pts  = pts3d[mask].astype(np.float64)
         cols = img[mask][:, ::-1].astype(np.float64) / 255.0
@@ -720,12 +649,10 @@ def build_point_cloud(sess, vo, Q):
         if len(pts) < STAT_K + 1:
             continue
 
-        # -- Transformar a coordenadas mundo con la pose VO -----------
         T_pose = poses[frame_idx]
         pts_h  = np.hstack([pts, np.ones((len(pts), 1))])
         pts_w  = (T_pose @ pts_h.T).T[:, :3]
 
-        # -- Filtrar puntos detrás del plano mundo (Z negativo) -------
         valid_w = pts_w[:, 2] > 0
         pts_w   = pts_w[valid_w]
         cols    = cols[valid_w]
@@ -740,7 +667,6 @@ def build_point_cloud(sess, vo, Q):
         if len(pcd.points) < 50:
             continue
 
-        # -- 3. ICP contra el ultimo frame aceptado -------------------
         if prev_pcd is not None:
             result = o3d.pipelines.registration.registration_icp(
                 source=pcd,
@@ -754,25 +680,22 @@ def build_point_cloud(sess, vo, Q):
                     max_iteration=ICP_MAX_ITER
                 ),
             )
-
-            # -- 4. Descartar frame si fitness < ICP_MIN_FIT ----------
             if result.fitness < ICP_MIN_FIT:
-                skipped += 1
-                continue   # prev_pcd no se actualiza: proximo frame se alinea al ultimo bueno
-
+                skipped_icp += 1
+                continue
             pcd.transform(result.transformation)
 
-        # Frame aceptado: actualizar referencia y acumular
         prev_pcd      = pcd
         prev_pos      = cur_pos
         pcd_combined += pcd
         processed    += 1
 
         if processed % 10 == 0:
-            print(f"  [PC] {processed} acumulados, {skipped} ICP + {skipped_pose} pose descartados...")
+            print(f"  [PC] {processed} acumulados, "
+                  f"{skipped_icp} ICP + {skipped_pose} pose descartados...")
 
-    print(f"  [PC] Resumen: {processed} acumulados, {skipped} ICP + "
-          f"{skipped_pose} pose < 5mm descartados")
+    print(f"  [PC] Resumen: {processed} acumulados, "
+          f"{skipped_icp} ICP + {skipped_pose} pose < {MIN_POSE_MOV}mm descartados")
 
     if len(pcd_combined.points) == 0:
         print("  [PC] Nube vacia, no se genera archivo")
@@ -785,9 +708,6 @@ def build_point_cloud(sess, vo, Q):
         nb_points=RAD_POINTS, radius=RAD_RADIUS
     )
 
-    # -- DBSCAN: conservar solo el cluster principal ----------------
-    # Elimina islas creadas por saltos de odometria que sobrevivieron
-    # al filtrado de radio (pueden ser densas localmente).
     with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
         labels = np.array(pcd_tmp.cluster_dbscan(
             eps=60.0, min_points=20, print_progress=False
@@ -797,35 +717,25 @@ def build_point_cloud(sess, vo, Q):
         counts    = np.bincount(labels[labels >= 0])
         main_lbl  = int(counts.argmax())
         pcd_final = pcd_tmp.select_by_index(np.where(labels == main_lbl)[0])
-        n_noise   = int(np.sum(labels < 0))
-        n_other   = int(np.sum((labels >= 0) & (labels != main_lbl)))
         print(f"  [PC] DBSCAN: {len(counts)} clusters -> "
               f"principal={len(pcd_final.points):,}pts  "
-              f"ruido={n_noise}  otros={n_other}")
+              f"ruido={int(np.sum(labels < 0))}  "
+              f"otros={int(np.sum((labels >= 0) & (labels != main_lbl)))}")
     else:
         pcd_final = pcd_tmp
-        print("  [PC] DBSCAN: sin clusters detectados, usando nube completa")
 
-    n_clean = len(pcd_final.points)
-    print(f"  [PC] Bruto: {n_bruto:,} -> voxel: {len(pcd_combined.points):,} "
-          f"-> radius: {len(pcd_tmp.points):,} -> dbscan: {n_clean:,}")
-
-    # -- Detectar plano del suelo ------------------------------------
+    # Detectar suelo y alinear
     floor_inliers = None
     R_align       = np.eye(3)
 
     try:
         plane_model, inliers = pcd_final.segment_plane(
-            distance_threshold=30.0,
-            ransac_n=3,
-            num_iterations=1000,
+            distance_threshold=30.0, ransac_n=3, num_iterations=1000
         )
         floor_inliers = inliers
-        a, b, c, d = plane_model
-        normal = np.array([a, b, c], dtype=np.float64)
-        normal /= np.linalg.norm(normal)
-
-        # Orientar la normal hacia arriba (Y positivo en Open3D = arriba)
+        a, b, c, d   = plane_model
+        normal        = np.array([a, b, c], dtype=np.float64)
+        normal       /= np.linalg.norm(normal)
         if normal[1] < 0:
             normal = -normal
 
@@ -842,35 +752,29 @@ def build_point_cloud(sess, vo, Q):
             ])
             R_align = np.eye(3) + vx + vx @ vx * ((1 - cos_a) / (s * s))
 
-        print(f"  [PC] Plano suelo: [{a:.4f}, {b:.4f}, {c:.4f}, {d:.4f}]  "
-              f"inliers={len(inliers)}")
-        print(f"  [PC] Normal suelo: {normal}  -> rotacion aplicada")
+        print(f"  [PC] Suelo detectado: normal={np.round(normal,3)}, inliers={len(inliers)}")
 
     except Exception as e:
-        print(f"  [PC] segment_plane fallo: {e}  (exportando sin alineacion)")
+        print(f"  [PC] segment_plane fallo: {e}")
 
-    # -- Separar suelo y paredes -------------------------------------
     if floor_inliers is not None:
-        pcd_floor  = pcd_final.select_by_index(floor_inliers)
-        pcd_walls  = pcd_final.select_by_index(floor_inliers, invert=True)
+        pcd_walls = pcd_final.select_by_index(floor_inliers, invert=True)
     else:
-        pcd_walls  = pcd_final
-        pcd_floor  = o3d.geometry.PointCloud()
+        pcd_walls = pcd_final
 
-    # -- Aplicar rotacion de alineacion a ambas nubes ----------------
     center = pcd_final.get_center()
     pcd_final.rotate(R_align, center=center)
     pcd_walls.rotate(R_align, center=center)
 
-    # -- Exportar dos PLY --------------------------------------------
-    out_final  = str(sd / 'mapa_final.ply')
-    out_walls  = str(sd / 'mapa_paredes.ply')
+    out_final = str(sd / 'mapa_final.ply')
+    out_walls = str(sd / 'mapa_paredes.ply')
 
     o3d.io.write_point_cloud(out_final, pcd_final)
     o3d.io.write_point_cloud(out_walls, pcd_walls)
 
-    print(f"  [PC] mapa_final.ply   -> {len(pcd_final.points):,} puntos  ({out_final})")
-    print(f"  [PC] mapa_paredes.ply -> {len(pcd_walls.points):,} puntos  ({out_walls})")
+    print(f"\n  [PC] Bruto: {n_bruto:,} -> final: {len(pcd_final.points):,} puntos")
+    print(f"  [PC] Guardado: {out_final}")
+    print(f"  [PC] Guardado: {out_walls}")
 
 
 # ==================================================================
@@ -879,14 +783,12 @@ def build_point_cloud(sess, vo, Q):
 
 def main():
     print("=" * 58)
-    print("  client_3.py - Stereo SLAM con RAFT-Stereo + GPU")
+    print("  client_3.py - Stereo SLAM offline")
     print("=" * 58)
 
-    # -- 1. Cargar RAFT-Stereo en GPU -----------------------------
     print("\n[1/4] Cargando RAFT-Stereo en GPU...")
     model, args = load_raft_model()
 
-    # -- 2. Conectar al servidor ----------------------------------
     print(f"\n[2/4] Conectando a Pi ({PI_IP})...")
     cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     cmd_sock.connect((PI_IP, 9999))
@@ -896,11 +798,10 @@ def main():
     vid_sock.connect((PI_IP, 9998))
     print("  OK Video conectado (puerto 9998)")
 
-    # -- 3. Leer primer frame para detectar resolucion real -------
     print("\n[3/4] Detectando resolucion del stream...")
     first_frame, first_data = read_one_frame(vid_sock)
     if first_frame is None:
-        print("  ERROR No se pudo leer el primer frame. Verifica server_2.py.")
+        print("  ERROR No se pudo leer el primer frame.")
         cmd_sock.close()
         vid_sock.close()
         return
@@ -909,42 +810,23 @@ def main():
     lens_w = w // 2
     lens_h = h
 
-    # -- 4. Calcular mapas de rectificacion -----------------------
     print("\n[4/4] Calculando mapas de rectificacion estereo...")
     maps_izq, maps_der, Q, K_rect = load_rectification(CAL_JSON, lens_w, lens_h)
     print("  OK Mapas listos")
-    print(f"  Matriz Q:\n{np.array2string(Q, precision=4, suppress_small=True)}")
-    
 
-    # -- Crear sesion de captura ----------------------------------
     print("\nCreando sesion de captura...")
     sess = create_session() if SAVE_FRAMES else None
 
-    # -- Hilo de guardado en disco (I/O) -------------------------
     t_save = threading.Thread(
-        target=save_worker,
-        args=(sess,),
-        daemon=True,
-        name='Save-IO',
+        target=save_worker, args=(sess,), daemon=True, name='Save-IO'
     )
     t_save.start()
 
-    # -- Hilo de comandos -----------------------------------------
     t_cmd = threading.Thread(
-        target=handle_commands,
-        args=(cmd_sock,),
-        daemon=True,
-        name='Commands',
+        target=handle_commands, args=(cmd_sock,), daemon=True, name='Commands'
     )
     t_cmd.start()
 
-
-    print("\n> Stream iniciado.")
-    print("> Fase 1: grabando frames a disco (sin RAFT en vivo)")
-    print("> Al cerrar con X arranca el SLAM offline automaticamente\n")
-
-
-    # -- Loop de video en hilo separado ---------------------------
     t_video = threading.Thread(
         target=video_loop,
         args=(vid_sock, maps_izq, maps_der, sess, (first_frame, first_data)),
@@ -953,7 +835,11 @@ def main():
     )
     t_video.start()
 
-    # -- GUI loop en hilo principal -------------------------------
+    print("\n> Stream iniciado.")
+    print("> Fase 1: grabando frames a disco")
+    print("> W/A/S/D = mover | Q = frenar | X = salir y procesar\n")
+
+    # GUI en hilo principal
     try:
         while not stop_event.is_set():
             with latest_preview['lock']:
@@ -961,29 +847,30 @@ def main():
                 der = latest_preview['der']
 
             if izq is not None:
-                cv2.imshow('Izquierdo rectificado', cv2.resize(izq, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
+                cv2.imshow('Izquierdo rectificado',
+                           cv2.resize(izq, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
             if der is not None:
-                cv2.imshow('Derecho rectificado', cv2.resize(der, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
+                cv2.imshow('Derecho rectificado',
+                           cv2.resize(der, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
 
             key = cv2.waitKey(33) & 0xFF
             if key == ord('x'):
                 request_shutdown()
                 break
+
         cv2.destroyAllWindows()
 
     finally:
         stop_event.set()
         t_video.join(timeout=5)
-        t_save.join(timeout=10)
+        t_save.join(timeout=15)
         t_cmd.join(timeout=3)
 
-        # -- Fase 2: SLAM offline sobre todos los frames grabados --
-        print("\n> Fase 2: Iniciando SLAM offline sobre frames grabados (puede tardar varios minutos)...")
+        print("\n> Fase 2: SLAM offline (puede tardar varios minutos)...")
         vo = slam_offline(sess, model, args, Q, K_rect)
 
-        print("\n> Fase 3: SLAM terminado, generando point cloud con poses corregidas (puede tardar varios minutos)...")
-        # -- Fase 3: generar point cloud con poses corregidas ------
         if vo is not None:
+            print("\n> Fase 3: Generando point cloud...")
             build_point_cloud(sess, vo, Q)
 
         close_session(sess)
@@ -996,7 +883,6 @@ def main():
         except Exception:
             pass
         print("\nOK Sesion cerrada correctamente.")
-  
 
 
 if __name__ == '__main__':
