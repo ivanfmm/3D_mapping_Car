@@ -361,82 +361,6 @@ def save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp
 
 
 # ==================================================================
-#  HILO DE INFERENCIA RAFT-Stereo  (GPU)
-# ==================================================================
-
-def inference_worker(model, args, sess):
-    """
-    Consume frames de infer_queue, ejecuta RAFT-Stereo (GPU)
-    y encola el resultado en vo_queue para el hilo de VO (CPU).
-    """
-    while not stop_event.is_set():
-        try:
-            item = infer_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        idx, raw_bytes, frame, rect_izq, rect_der = item
-        try:
-            # -- Disparidad RAFT-Stereo (GPU) -------------------------
-            disp       = run_raft(model, args, rect_izq, rect_der)
-            disp_color = disp_to_color(disp)
-
-            with latest_disp['lock']:
-                latest_disp['img'] = disp_color.copy()
-
-            # -- Guardar frames (hilo I/O separado) ------------------
-            if SAVE_FRAMES:
-                try:
-                    save_queue.put_nowait(
-                        (idx, raw_bytes, frame, rect_izq, rect_der, disp_color, disp)
-                    )
-                except queue.Full:
-                    pass
-
-            # -- Encolar para VO (CPU) --------------------------------
-            try:
-                vo_queue.put_nowait((idx, rect_izq, disp))
-            except queue.Full:
-                pass
-
-        except Exception as e:
-            print(f"  AVISO Error inferencia frame {idx}: {e}")
-
-        infer_queue.task_done()
-
-
-# ==================================================================
-#  HILO DE ODOMETRIA VISUAL  (CPU)
-# ==================================================================
-
-def vo_worker(vo):
-    """
-    Corre en hilo separado del de RAFT.
-    Consume de vo_queue y ejecuta VO (ORB + solvePnPRansac) en CPU.
-    """
-    _vo_print_every = 10
-    while not stop_event.is_set():
-        try:
-            item = vo_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        idx, rect_izq, disp = item
-        try:
-            result = vo.update(rect_izq, disp, frame_idx=idx)
-
-            if result is not None and idx % _vo_print_every == 0:
-                R, t = result
-                print(f"  [VO] frame {idx:05d} | "
-                      f"dx={t[0]:+7.1f}mm  dy={t[1]:+7.1f}mm  dz={t[2]:+7.1f}mm")
-
-        except Exception as e:
-            print(f"  AVISO Error VO frame {idx}: {e}")
-
-        vo_queue.task_done()
-
-
-# ==================================================================
 #  COMANDOS (WASD)
 # ==================================================================
 
@@ -565,10 +489,134 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
         request_shutdown()
         print(f"  Frames recibidos: {frame_index}")
 
+# ==================================================================
+#  SLAM OFFLINE  (Fase 2: RAFT + VO sobre frames guardados)
+# ==================================================================
+
+def slam_offline(sess, model, args, Q, K_rect):
+    """
+    Procesa TODOS los frames guardados en disco en dos hilos en pipeline:
+      lector_disco  ->  raft_queue  ->  raft_worker (GPU)
+                                    ->  vo_queue    ->  vo_worker (CPU)
+
+    Al terminar retorna el objeto VisualOdometry con todas las poses
+    para que build_point_cloud() las use.
+    """
+    if sess is None or not SAVE_FRAMES:
+        print("  [SLAM] Sin sesion de captura, saltando SLAM offline.")
+        return None
+
+    sd       = sess['sd']
+    left_dir = sd / 'left_rect'
+    rder_dir = sd / 'right_rect'
+
+    left_files = sorted(left_dir.glob('left_*.jpg'))
+    rder_files = sorted(rder_dir.glob('right_*.jpg'))
+
+    if not left_files:
+        print("  [SLAM] No se encontraron frames en disco.")
+        return None
+
+    # Parear izq/der por nombre de frame
+    pairs = []
+    for lp in left_files:
+        idx_str = lp.stem.replace('left_', '')
+        rp = rder_dir / f'right_{idx_str}.jpg'
+        if rp.exists():
+            pairs.append((int(idx_str), lp, rp))
+
+    n_total = len(pairs)
+    print(f"\n{'='*58}")
+    print(f"  SLAM OFFLINE — {n_total} frames a procesar")
+    print(f"{'='*58}")
+
+    raft_queue_off = queue.Queue(maxsize=4)   # lector  -> RAFT
+    vo_queue_off   = queue.Queue(maxsize=4)   # RAFT    -> VO
+    slam_stop      = threading.Event()
+
+    vo = VisualOdometry(Q, K_rect)
+
+    # -- Hilo lector: lee jpgs del disco y los encola ---------------
+    def lector_worker():
+        for frame_idx, lp, rp in pairs:
+            if slam_stop.is_set():
+                break
+            izq = cv2.imread(str(lp))
+            der = cv2.imread(str(rp))
+            if izq is None or der is None:
+                continue
+            raft_queue_off.put((frame_idx, izq, der))
+        raft_queue_off.put(None)   # sentinel
+
+    # -- Hilo RAFT: GPU sin límite de tiempo -------------------------
+    def raft_worker():
+        processed = 0
+        while not slam_stop.is_set():
+            item = raft_queue_off.get()
+            if item is None:
+                vo_queue_off.put(None)   # propagar sentinel
+                break
+            frame_idx, izq, der = item
+            try:
+                disp = run_raft(model, args, izq, der)
+                vo_queue_off.put((frame_idx, izq, disp))
+                processed += 1
+                if processed % 20 == 0:
+                    print(f"  [RAFT] {processed}/{n_total} frames procesados...")
+            except Exception as e:
+                print(f"  AVISO RAFT frame {frame_idx}: {e}")
+
+    # -- Hilo VO: CPU, procesa todos los frames ----------------------
+    vo_done = threading.Event()
+    validos = [0]
+    total   = [0]
+
+    def vo_worker_off():
+        while not slam_stop.is_set():
+            item = vo_queue_off.get()
+            if item is None:
+                break
+            frame_idx, izq, disp = item
+            total[0] += 1
+            try:
+                result = vo.update(izq, disp, frame_idx=frame_idx)
+                if result is not None:
+                    validos[0] += 1
+                    if validos[0] % 10 == 0:
+                        R, t = result
+                        print(f"  [VO]  frame {frame_idx:05d} | "
+                              f"dx={t[0]:+7.1f}  dy={t[1]:+7.1f}  dz={t[2]:+7.1f} mm"
+                              f"  ({validos[0]}/{total[0]} válidos)")
+            except Exception as e:
+                print(f"  AVISO VO frame {frame_idx}: {e}")
+        vo_done.set()
+
+    # -- Lanzar los tres hilos en pipeline --------------------------
+    t_lector = threading.Thread(target=lector_worker, daemon=True, name='Lector')
+    t_raft   = threading.Thread(target=raft_worker,   daemon=True, name='RAFT-off')
+    t_vo     = threading.Thread(target=vo_worker_off, daemon=True, name='VO-off')
+
+    t_lector.start()
+    t_raft.start()
+    t_vo.start()
+
+    t_lector.join()
+    t_raft.join()
+    vo_done.wait()
+
+    print(f"\n  [SLAM] Offline completo: {validos[0]}/{total[0]} frames con pose válida")
+    if total[0] > 0:
+        pct = 100 * validos[0] / total[0]
+        print(f"  [SLAM] Cobertura: {pct:.1f}%"
+              + (" — buena" if pct > 60 else " — baja, revisa velocidad del carrito"))
+
+    return vo
+
+
 
 
 # ==================================================================
-#  GENERACION DE NUBE DE PUNTOS  (fase post-sesion)
+#BUILD POINT CLOUD DESDE POSES + DISPARIDAD
 # ==================================================================
 def build_point_cloud(sess, vo, Q):
     """
@@ -866,32 +914,11 @@ def main():
     maps_izq, maps_der, Q, K_rect = load_rectification(CAL_JSON, lens_w, lens_h)
     print("  OK Mapas listos")
     print(f"  Matriz Q:\n{np.array2string(Q, precision=4, suppress_small=True)}")
-
-    # -- Instanciar odometria visual ------------------------------
-    vo = VisualOdometry(Q, K_rect)
-    print("  OK VisualOdometry lista")
+    
 
     # -- Crear sesion de captura ----------------------------------
     print("\nCreando sesion de captura...")
     sess = create_session() if SAVE_FRAMES else None
-
-    # -- Hilo RAFT-Stereo (GPU) -----------------------------------
-    t_infer = threading.Thread(
-        target=inference_worker,
-        args=(model, args, sess),
-        daemon=True,
-        name='RAFT-GPU',
-    )
-    t_infer.start()
-
-    # -- Hilo Odometria Visual (CPU) ------------------------------
-    t_vo = threading.Thread(
-        target=vo_worker,
-        args=(vo,),
-        daemon=True,
-        name='VO-CPU',
-    )
-    t_vo.start()
 
     # -- Hilo de guardado en disco (I/O) -------------------------
     t_save = threading.Thread(
@@ -911,8 +938,11 @@ def main():
     )
     t_cmd.start()
 
+
     print("\n> Stream iniciado.")
-    print("> Arquitectura: video(hilo) -> RAFT(GPU) -> VO(CPU) | GUI en hilo principal\n")
+    print("> Fase 1: grabando frames a disco (sin RAFT en vivo)")
+    print("> Al cerrar con X arranca el SLAM offline automaticamente\n")
+
 
     # -- Loop de video en hilo separado ---------------------------
     t_video = threading.Thread(
@@ -923,35 +953,39 @@ def main():
     )
     t_video.start()
 
-    # -- GUI loop en hilo principal (cv2.imshow/waitKey requieren hilo principal) --
+    # -- GUI loop en hilo principal -------------------------------
     try:
         while not stop_event.is_set():
             with latest_preview['lock']:
                 izq = latest_preview['izq']
                 der = latest_preview['der']
-            with latest_disp['lock']:
-                disp_img = latest_disp['img']
 
             if izq is not None:
                 cv2.imshow('Izquierdo rectificado', cv2.resize(izq, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
             if der is not None:
                 cv2.imshow('Derecho rectificado', cv2.resize(der, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
-            if disp_img is not None:
-                cv2.imshow('Disparidad RAFT-Stereo', cv2.resize(disp_img, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
 
-            key = cv2.waitKey(33) & 0xFF  # ~30 fps
+            key = cv2.waitKey(33) & 0xFF
             if key == ord('x'):
                 request_shutdown()
                 break
         cv2.destroyAllWindows()
+
     finally:
         stop_event.set()
         t_video.join(timeout=5)
-        t_infer.join(timeout=5)
-        t_vo.join(timeout=5)
         t_save.join(timeout=10)
         t_cmd.join(timeout=3)
-        build_point_cloud(sess, vo, Q)
+
+        # -- Fase 2: SLAM offline sobre todos los frames grabados --
+        print("\n> Fase 2: Iniciando SLAM offline sobre frames grabados (puede tardar varios minutos)...")
+        vo = slam_offline(sess, model, args, Q, K_rect)
+
+        print("\n> Fase 3: SLAM terminado, generando point cloud con poses corregidas (puede tardar varios minutos)...")
+        # -- Fase 3: generar point cloud con poses corregidas ------
+        if vo is not None:
+            build_point_cloud(sess, vo, Q)
+
         close_session(sess)
         try:
             cmd_sock.close()
@@ -962,6 +996,7 @@ def main():
         except Exception:
             pass
         print("\nOK Sesion cerrada correctamente.")
+  
 
 
 if __name__ == '__main__':
