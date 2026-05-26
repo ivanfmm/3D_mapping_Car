@@ -667,23 +667,23 @@ def build_point_cloud(sess, vo, Q):
         if len(pcd.points) < 50:
             continue
 
-        if prev_pcd is not None:
-            result = o3d.pipelines.registration.registration_icp(
-                source=pcd,
-                target=prev_pcd,
-                max_correspondence_distance=ICP_MAX_DIST,
-                init=np.eye(4),
-                estimation_method=(
-                    o3d.pipelines.registration.TransformationEstimationPointToPoint()
-                ),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=ICP_MAX_ITER
-                ),
-            )
-            if result.fitness < ICP_MIN_FIT:
-                skipped_icp += 1
-                continue
-            pcd.transform(result.transformation)
+        # if prev_pcd is not None:
+        #     result = o3d.pipelines.registration.registration_icp(
+        #         source=pcd,
+        #         target=prev_pcd,
+        #         max_correspondence_distance=ICP_MAX_DIST,
+        #         init=np.eye(4),
+        #         estimation_method=(
+        #             o3d.pipelines.registration.TransformationEstimationPointToPoint()
+        #         ),
+        #         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+        #             max_iteration=ICP_MAX_ITER
+        #         ),
+        #     )
+        #     if result.fitness < ICP_MIN_FIT:
+        #         skipped_icp += 1
+        #         continue
+        #     pcd.transform(result.transformation)
 
         prev_pcd      = pcd
         prev_pos      = cur_pos
