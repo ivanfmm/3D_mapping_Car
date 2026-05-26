@@ -24,7 +24,7 @@ from scipy.optimize import minimize
 # ==================================================================
 #  Constantes de loop closure y PGO
 # ==================================================================
-MIN_LOOP_SEP      = 10    # frames minimos de separacion para loop closure \eran 15
+MIN_LOOP_SEP      = 80    # frames minimos de separacion para loop closure \eran 15
 MIN_LOOP_VOTES    = 8    # votos FAISS minimos para considerar candidato \era 12
 MIN_LOOP_INLIERS  = 6     # inliers PnP para verificacion geometrica de loop \era 8
 LOOP_CHECK_EVERY  = 1     # buscar loop closure en CADA frame
@@ -210,7 +210,7 @@ class VisualOdometry:
         # nlevels=6: para 640x360 la piramide de 8 niveles llega a ~80px (inutil)
         # fastThreshold=10: detecta mas esquinas en zonas de poca textura
         self.orb = cv2.ORB_create(
-            nfeatures    = 500,
+            nfeatures    = 1000,
             scaleFactor  = 1.2,
             nlevels      = 6,
             edgeThreshold= 19,
@@ -287,6 +287,7 @@ class VisualOdometry:
             return None
 
         if des is None or len(des) < 8:
+            print(f"Frame  failed des < 8")
             self._save_state(gray, kp, des, disp)
             self._prev_idx = frame_idx
             return None
@@ -298,6 +299,7 @@ class VisualOdometry:
             if len(pair) == 2 and pair[0].distance < LOWE_RATIO * pair[1].distance
         ]
         if len(matches) < MIN_PNP_MATCHES:
+            print(f"Frame  failed matches < MIN_PNP_MATCHES")
             self._save_state(gray, kp, des, disp)
             self._prev_idx = frame_idx
             return None
@@ -310,6 +312,7 @@ class VisualOdometry:
         pts3d = self._deproject(pts_prev_2d, self.prev_disp)
         valid = pts3d[:, 2] > 0
         if valid.sum() < MIN_PNP_INLIERS:
+            print(f"Frame  failed valid.sum() < MIN_PNP_INLIERS")
             self._save_state(gray, kp, des, disp)
             self._prev_idx = frame_idx
             return None
@@ -325,6 +328,7 @@ class VisualOdometry:
         )
 
         if not success or inliers is None or len(inliers) < MIN_PNP_INLIERS:
+            print(f"Frame  failed not success or no inliers or inliers < MIN_PNP_INLIERS")
             self._save_state(gray, kp, des, disp)
             self._prev_idx = frame_idx
             return None
@@ -347,6 +351,7 @@ class VisualOdometry:
                 self._save_state(gray, kp, des, disp)
                 self._prev_idx = frame_idx
             # No acumular pose en ninguno de los dos casos
+            print(f"Frame  failed tvec_mag > JUMP_MAX_TRANS or angle_deg > JUMP_MAX_ROT")
             return None
 
         self._consec_reject = 0
