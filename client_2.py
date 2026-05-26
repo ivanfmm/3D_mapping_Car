@@ -42,26 +42,38 @@ else:
 # ==================================================================
 #  CONFIGURACION
 # ==================================================================
-PI_IP          = '10.42.0.146'
-CAL_JSON       = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/parac/estereo_cal.json')
-RAFT_DIR       = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/corrercudapytorch/RAFT-Stereo')
-RAFT_MODEL     = RAFT_DIR / 'models/raftstereo-middlebury.pth'
-SAVE_ROOT      = Path('captured_frames')
+BASE_DIR       = Path(__file__).resolve().parent
+PI_IP          = os.environ.get('PI_IP', '10.42.0.146')
+CAL_JSON       = Path(os.environ.get('CAL_JSON', '/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/parac/estereo_cal.json'))
+DEFAULT_RAFT_DIR = BASE_DIR / 'RAFT-Stereo'
+LEGACY_RAFT_DIR  = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/corrercudapytorch/RAFT-Stereo')
+RAFT_DIR       = Path(os.environ.get(
+    'RAFT_DIR',
+    DEFAULT_RAFT_DIR if DEFAULT_RAFT_DIR.exists() else LEGACY_RAFT_DIR
+))
+RAFT_MODEL     = Path(os.environ.get('RAFT_MODEL', RAFT_DIR / 'models/raftstereo-middlebury.pth'))
+SAVE_ROOT      = BASE_DIR / 'captured_frames'
 SAVE_FRAMES    = True
 MAX_FRAME_SIZE = 50 * 1024 * 1024
-INFER_ITERS    = 20   # offline: podemos usar mas iteraciones
+INFER_ITERS    = 20
 PREVIEW_SCALE  = 0.5
 
 # -- RAFT-Stereo path setup ----------------------------------------
 sys.path.insert(0, str(RAFT_DIR))
 sys.path.insert(0, str(RAFT_DIR / 'core'))
-from raft_stereo import RAFTStereo
+try:
+    from raft_stereo import RAFTStereo
+except Exception as e:
+    raise RuntimeError(
+        f"No se pudo importar RAFT-Stereo desde {RAFT_DIR}. "
+        "Configura la variable de entorno RAFT_DIR apuntando a la carpeta RAFT-Stereo."
+    ) from e
 
 # -- Estado global -------------------------------------------------
 stop_event     = threading.Event()
 command_socket = None
 command_lock   = threading.Lock()
-save_queue     = queue.Queue(maxsize=30)  # video -> disco
+save_queue     = queue.Queue(maxsize=30)
 latest_preview = {'izq': None, 'der': None, 'lock': threading.Lock()}
 
 
@@ -100,6 +112,9 @@ def read_one_frame(sock):
 
     frame_np = np.frombuffer(frame_data, dtype=np.uint8)
     frame    = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
+    if frame is None:
+        print("  ERROR Frame JPEG corrupto o no decodificable")
+        return None, None
     return frame, frame_data
 
 
@@ -136,10 +151,15 @@ def load_rectification(cal_path, lens_w, lens_h):
     maps_izq = cv2.initUndistortRectifyMap(K_izq, D_izq, R1, P1, size, cv2.CV_32FC1)
     maps_der = cv2.initUndistortRectifyMap(K_der, D_der, R2, P2, size, cv2.CV_32FC1)
 
-    print(f"  Resolucion por lente: {lens_w}x{lens_h}")
+    print(f"  Calibracion por lente: {cal_w}x{cal_h}")
+    print(f"  Resolucion recibida por lente: {lens_w}x{lens_h}")
     print(f"  Escala vs calibracion: sx={sx:.3f}  sy={sy:.3f}")
-    if sx < 0.5:
-        print("  AVISO  Resolucion baja vs calibracion")
+    if (lens_w, lens_h) != (cal_w, cal_h):
+        print("  AVISO Resolucion de uso distinta a la calibracion.")
+        print("        Se recalculan K, mapas y Q para esta resolucion,")
+        print("        pero para mejor precision conviene capturar o recalibrar con la misma resolucion.")
+    if abs(sx - sy) > 0.05:
+        print("  AVISO Escalado no uniforme entre X/Y; la profundidad puede perder precision.")
 
     K_rect = P1[:3, :3].copy()
     return maps_izq, maps_der, Q, K_rect
@@ -254,32 +274,22 @@ def close_session(sess):
 
 
 # ==================================================================
-#  HILO DE GUARDADO EN DISCO (Fase 1 - solo frames, sin RAFT)
+#  HILO DE GUARDADO EN DISCO
 # ==================================================================
 
 def save_worker(sess):
-    while not stop_event.is_set():
+    while True:
+        item = save_queue.get()
         try:
-            item = save_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        try:
-            _save_frame(sess, *item)
-        except Exception as e:
-            print(f"  AVISO Error guardado frame {item[0]}: {e}")
-        save_queue.task_done()
-
-    # Vaciar cola al cerrar
-    while not save_queue.empty():
-        try:
-            item = save_queue.get_nowait()
-        except queue.Empty:
-            break
-        try:
-            _save_frame(sess, *item)
-        except Exception:
-            pass
-        save_queue.task_done()
+            if item is None:
+                return
+            try:
+                _save_frame(sess, *item)
+            except Exception as e:
+                frame_id = item[0] if isinstance(item, tuple) and item else '?'
+                print(f"  AVISO Error guardado frame {frame_id}: {e}")
+        finally:
+            save_queue.task_done()
 
 
 def _save_frame(sess, idx, raw_bytes, frame, rect_izq, rect_der):
@@ -384,7 +394,7 @@ def handle_commands(cmd_sock):
 
 
 # ==================================================================
-#  LOOP DE VIDEO (Fase 1 - captura y rectifica, guarda directo)
+#  LOOP DE VIDEO
 # ==================================================================
 
 def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
@@ -395,26 +405,34 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
     def process(frame, frame_data):
         nonlocal frame_index
         h, w = frame.shape[:2]
+        if w % 2 != 0:
+            raise RuntimeError(f"Ancho de frame impar ({w}); no se puede dividir en estereo.")
 
         raw_izq = frame[:, :w // 2]
         raw_der = frame[:, w // 2:]
 
+        if raw_izq.shape[:2] != map1_izq.shape[:2] or raw_der.shape[:2] != map1_der.shape[:2]:
+            raise RuntimeError(
+                f"Tamano de lente cambio durante ejecucion: "
+                f"izq={raw_izq.shape[:2]}, der={raw_der.shape[:2]}, "
+                f"mapas={map1_izq.shape[:2]}"
+            )
+
         rect_izq = cv2.remap(raw_izq, map1_izq, map2_izq, cv2.INTER_LINEAR)
         rect_der = cv2.remap(raw_der, map1_der, map2_der, cv2.INTER_LINEAR)
 
-        # Actualizar preview para GUI
         with latest_preview['lock']:
             latest_preview['izq'] = rect_izq.copy()
             latest_preview['der'] = rect_der.copy()
 
-        # Guardar directamente en disco (sin RAFT en esta fase)
         if SAVE_FRAMES:
-            try:
-                save_queue.put_nowait(
-                    (frame_index, bytes(frame_data), frame, rect_izq, rect_der)
-                )
-            except queue.Full:
-                pass
+            item = (frame_index, bytes(frame_data), frame, rect_izq, rect_der)
+            while not stop_event.is_set():
+                try:
+                    save_queue.put(item, timeout=0.5)
+                    break
+                except queue.Full:
+                    print("  AVISO Guardado atrasado: esperando a que se vacie la cola...")
 
         frame_index += 1
 
@@ -440,7 +458,7 @@ def video_loop(vid_sock, maps_izq, maps_der, sess, first_frame=None):
 
 
 # ==================================================================
-#  SLAM OFFLINE (Fase 2 - RAFT + VO sobre frames guardados)
+#  SLAM OFFLINE (Fase 2)
 # ==================================================================
 
 def slam_offline(sess, model, args, Q, K_rect):
@@ -471,7 +489,6 @@ def slam_offline(sess, model, args, Q, K_rect):
     print(f"  SLAM OFFLINE — {n_total} pares de frames")
     print(f"{'='*58}")
 
-    # Crear carpeta disparity_raw
     disp_raw_dir = sd / 'disparity_raw'
     disp_raw_dir.mkdir(exist_ok=True)
 
@@ -566,30 +583,36 @@ def build_point_cloud(sess, vo, Q):
     if sess is None or not SAVE_FRAMES:
         return
 
+    # ------------------------------------------------------------------
+    # PARAMETROS  (ajustados para mayor densidad de puntos)
+    # ------------------------------------------------------------------
     DISP_MIN     = 2.0
     Z_MIN        = 100.0
     Z_MAX        = 8000.0
-    VOXEL_SIZE   = 20.0
+    VOXEL_SIZE   = 15.0   # balance entre densidad y RAM
     STAT_K       = 20
     STAT_STD     = 2.0
-    RAD_POINTS   = 16
-    RAD_RADIUS   = 50.0
+    RAD_POINTS   = 8      # mas permisivo en zonas dispersas
+    RAD_RADIUS   = 40.0
     ICP_MAX_DIST = 100.0
     ICP_MIN_FIT  = 0.15
     ICP_MAX_ITER = 30
-    FRAME_STRIDE = 2
+    FRAME_STRIDE = 1      # era 2 — usa todos los frames
     MIN_POSE_MOV = 5.0
+    # ------------------------------------------------------------------
 
     sd       = sess['sd']
     raw_dir  = sd / 'disparity_raw'
     left_dir = sd / 'left_rect'
 
-    poses = vo.get_all_poses()
+    if hasattr(vo, 'get_valid_poses'):
+        poses = vo.get_valid_poses()
+    else:
+        poses = vo.get_all_poses()
     if not poses:
         print("  [PC] Sin poses disponibles")
         return
 
-    # Exportar trayectoria
     poses_path = sd / 'poses.txt'
     with open(str(poses_path), 'w') as f:
         f.write("frame_idx  X_mm        Y_mm        Z_mm\n")
@@ -653,7 +676,7 @@ def build_point_cloud(sess, vo, Q):
         pts_h  = np.hstack([pts, np.ones((len(pts), 1))])
         pts_w  = (T_pose @ pts_h.T).T[:, :3]
 
-        valid_w = pts_w[:, 2] > 0
+        valid_w = np.all(np.isfinite(pts_w), axis=1)
         pts_w   = pts_w[valid_w]
         cols    = cols[valid_w]
 
@@ -661,29 +684,15 @@ def build_point_cloud(sess, vo, Q):
         pcd.points = o3d.utility.Vector3dVector(pts_w)
         pcd.colors = o3d.utility.Vector3dVector(cols)
 
+        # Filtro estadistico por frame (mantener, es util para ruido local)
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=STAT_K, std_ratio=STAT_STD)
-        pcd    = pcd.voxel_down_sample(VOXEL_SIZE)
+
+        # ELIMINADO: voxel_down_sample por frame
+        # Antes se aplicaba aqui con VOXEL_SIZE=20, lo que tiraba puntos
+        # prematuramente. Ahora solo se aplica una vez al combinado final.
 
         if len(pcd.points) < 50:
             continue
-
-        # if prev_pcd is not None:
-        #     result = o3d.pipelines.registration.registration_icp(
-        #         source=pcd,
-        #         target=prev_pcd,
-        #         max_correspondence_distance=ICP_MAX_DIST,
-        #         init=np.eye(4),
-        #         estimation_method=(
-        #             o3d.pipelines.registration.TransformationEstimationPointToPoint()
-        #         ),
-        #         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-        #             max_iteration=ICP_MAX_ITER
-        #         ),
-        #     )
-        #     if result.fitness < ICP_MIN_FIT:
-        #         skipped_icp += 1
-        #         continue
-        #     pcd.transform(result.transformation)
 
         prev_pcd      = pcd
         prev_pos      = cur_pos
@@ -703,6 +712,7 @@ def build_point_cloud(sess, vo, Q):
 
     n_bruto = len(pcd_combined.points)
 
+    # Voxel downsample una sola vez sobre el combinado completo
     pcd_combined = pcd_combined.voxel_down_sample(VOXEL_SIZE)
     pcd_tmp, _   = pcd_combined.remove_radius_outlier(
         nb_points=RAD_POINTS, radius=RAD_RADIUS
@@ -723,6 +733,12 @@ def build_point_cloud(sess, vo, Q):
               f"otros={int(np.sum((labels >= 0) & (labels != main_lbl)))}")
     else:
         pcd_final = pcd_tmp
+
+    # Guardar raw antes de alineacion
+    pcd_raw_for_export = pcd_final.select_by_index(list(range(len(pcd_final.points))))
+    out_raw = str(sd / 'mapa_final_raw.ply')
+    o3d.io.write_point_cloud(out_raw, pcd_raw_for_export)
+    print(f"  [PC] Guardado raw sin alineacion: {out_raw}")
 
     # Detectar suelo y alinear
     floor_inliers = None
@@ -761,6 +777,10 @@ def build_point_cloud(sess, vo, Q):
         pcd_walls = pcd_final.select_by_index(floor_inliers, invert=True)
     else:
         pcd_walls = pcd_final
+
+    out_walls_raw = str(sd / 'mapa_paredes_raw.ply')
+    o3d.io.write_point_cloud(out_walls_raw, pcd_walls)
+    print(f"  [PC] Guardado paredes raw sin alineacion: {out_walls_raw}")
 
     center = pcd_final.get_center()
     pcd_final.rotate(R_align, center=center)
@@ -807,8 +827,16 @@ def main():
         return
 
     h, w   = first_frame.shape[:2]
+    if w % 2 != 0:
+        print(f"  ERROR Ancho de frame impar ({w}); no se puede dividir en estereo.")
+        request_shutdown()
+        cmd_sock.close()
+        vid_sock.close()
+        return
     lens_w = w // 2
     lens_h = h
+    print(f"  Frame completo recibido: {w}x{h}")
+    print(f"  Cada lente recibido: {lens_w}x{lens_h}")
 
     print("\n[4/4] Calculando mapas de rectificacion estereo...")
     maps_izq, maps_der, Q, K_rect = load_rectification(CAL_JSON, lens_w, lens_h)
@@ -816,6 +844,26 @@ def main():
 
     print("\nCreando sesion de captura...")
     sess = create_session() if SAVE_FRAMES else None
+    if sess is not None:
+        try:
+            with open(CAL_JSON, 'r', encoding='utf-8') as f:
+                cal_info = json.load(f)
+            cal_res = cal_info['lente_izquierdo']['resolucion']
+            session_info = {
+                'pi_ip': PI_IP,
+                'frame_completo_recibido': [w, h],
+                'lente_izquierdo_recibido': [lens_w, lens_h],
+                'lente_derecho_recibido': [lens_w, lens_h],
+                'calibracion_por_lente': cal_res,
+                'escala_vs_calibracion': [lens_w / cal_res[0], lens_h / cal_res[1]],
+                'cal_json': str(CAL_JSON),
+                'raft_dir': str(RAFT_DIR),
+                'raft_model': str(RAFT_MODEL),
+            }
+            with open(sess['sd'] / 'session_info.json', 'w', encoding='utf-8') as f:
+                json.dump(session_info, f, indent=2)
+        except Exception as e:
+            print(f"  AVISO No se pudo escribir session_info.json: {e}")
 
     t_save = threading.Thread(
         target=save_worker, args=(sess,), daemon=True, name='Save-IO'
@@ -839,7 +887,6 @@ def main():
     print("> Fase 1: grabando frames a disco")
     print("> W/A/S/D = mover | Q = frenar | X = salir y procesar\n")
 
-    # GUI en hilo principal
     try:
         while not stop_event.is_set():
             with latest_preview['lock']:
@@ -863,7 +910,10 @@ def main():
     finally:
         stop_event.set()
         t_video.join(timeout=5)
-        t_save.join(timeout=15)
+        if SAVE_FRAMES:
+            save_queue.put(None)
+            save_queue.join()
+            t_save.join(timeout=5)
         t_cmd.join(timeout=3)
 
         print("\n> Fase 2: SLAM offline (puede tardar varios minutos)...")
