@@ -589,7 +589,7 @@ def build_point_cloud(sess, vo, Q):
     DISP_MIN     = 2.0    # disparidad mínima confiable
     Z_MIN        = 100.0  # profundidad mínima en mm (10cm)
     Z_MAX        = 8000.0 # profundidad máxima en mm (8m)
-    VOXEL_SIZE   = 15.0   # tamaño del cubo de fusión en mm
+    VOXEL_SIZE   = 8.0   # tamaño del cubo de fusión en mm
     STAT_K       = 20     # vecinos para outlier estadístico
     STAT_STD     = 2.0    # umbral sigma
     RAD_POINTS   = 8      # vecinos mínimos para outlier radial
