@@ -586,32 +586,24 @@ def build_point_cloud(sess, vo, Q):
     # ------------------------------------------------------------------
     # PARAMETROS  (ajustados para mayor densidad de puntos)
     # ------------------------------------------------------------------
-    DISP_MIN     = 2.0
-    Z_MIN        = 100.0
-    Z_MAX        = 8000.0
-    VOXEL_SIZE   = 15.0   # balance entre densidad y RAM
-    STAT_K       = 20
-    STAT_STD     = 2.0
-    RAD_POINTS   = 8      # mas permisivo en zonas dispersas
-    RAD_RADIUS   = 40.0
-    ICP_MAX_DIST = 100.0
-    ICP_MIN_FIT  = 0.15
-    ICP_MAX_ITER = 30
-    FRAME_STRIDE = 1      # era 2 — usa todos los frames
-    MIN_POSE_MOV = 5.0
+    DISP_MIN     = 2.0    # disparidad mínima confiable
+    Z_MIN        = 100.0  # profundidad mínima en mm (10cm)
+    Z_MAX        = 8000.0 # profundidad máxima en mm (8m)
+    VOXEL_SIZE   = 15.0   # tamaño del cubo de fusión en mm
+    STAT_K       = 20     # vecinos para outlier estadístico
+    STAT_STD     = 2.0    # umbral sigma
+    RAD_POINTS   = 8      # vecinos mínimos para outlier radial
+    RAD_RADIUS   = 40.0   # radio de búsqueda en mm
+    ICP_MIN_FIT  = 0.15   # fitness mínimo para aceptar alineación
+    FRAME_STRIDE = 1      # usar todos los frames
+    MIN_POSE_MOV = 5.0    # movimiento mínimo entre frames en mm
     # ------------------------------------------------------------------
 
     sd       = sess['sd']
     raw_dir  = sd / 'disparity_raw'
     left_dir = sd / 'left_rect'
 
-    if hasattr(vo, 'get_valid_poses'):
-        poses = vo.get_valid_poses()
-    else:
-        poses = vo.get_all_poses()
-    if not poses:
-        print("  [PC] Sin poses disponibles")
-        return
+    poses = vo.get_all_poses()
 
     poses_path = sd / 'poses.txt'
     with open(str(poses_path), 'w') as f:
@@ -648,6 +640,7 @@ def build_point_cloud(sess, vo, Q):
         cur_pos = poses[frame_idx][:3, 3]
         if prev_pos is not None:
             if np.linalg.norm(cur_pos - prev_pos) < MIN_POSE_MOV:
+                print(f"Frame {frame_idx:06d} descartada porque o no se movio o fue muy poco")
                 skipped_pose += 1
                 continue
 
@@ -664,7 +657,27 @@ def build_point_cloud(sess, vo, Q):
             first_done = True
 
         z    = pts3d[:, :, 2]
-        mask = (disp > DISP_MIN) & np.isfinite(z) & (z > Z_MIN) & (z < Z_MAX)
+        # mask = (disp > DISP_MIN) & np.isfinite(z) & (z > Z_MIN) & (z < Z_MAX)
+        total_px = disp.size  # total de píxeles en el frame
+        # Filtro 1 — disparidad mínima
+        m1 = disp > DISP_MIN
+        # Filtro 2 — valores finitos
+        m2 = np.isfinite(z)
+        # Filtro 3 — profundidad mínima
+        m3 = z > Z_MIN
+        # Filtro 4 — profundidad máxima
+        m4 = z < Z_MAX
+
+        # Combinado final
+        mask = m1 & m2 & m3 & m4
+
+        if processed % 10 == 0:
+            print(f"\n  [PC] frame {frame_idx:05d} — {total_px:,} píxeles totales")
+            print(f"    disp < {DISP_MIN}  (sin info):  {(~m1).sum():>8,} eliminados  ({100*(~m1).sum()/total_px:.1f}%)")
+            print(f"    infinitos/NaN:           {(~m2).sum():>8,} eliminados  ({100*(~m2).sum()/total_px:.1f}%)")
+            print(f"    z < {Z_MIN}mm (muy cerca): {(~m3).sum():>8,} eliminados  ({100*(~m3).sum()/total_px:.1f}%)")
+            print(f"    z > {Z_MAX}mm (muy lejos): {(~m4).sum():>8,} eliminados  ({100*(~m4).sum()/total_px:.1f}%)")
+            print(f"    QUEDAN:                  {mask.sum():>8,} puntos     ({100*mask.sum()/total_px:.1f}%)")
 
         pts  = pts3d[mask].astype(np.float64)
         cols = img[mask][:, ::-1].astype(np.float64) / 255.0
@@ -685,7 +698,18 @@ def build_point_cloud(sess, vo, Q):
         pcd.colors = o3d.utility.Vector3dVector(cols)
 
         # Filtro estadistico por frame (mantener, es util para ruido local)
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=STAT_K, std_ratio=STAT_STD)
+        # pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=STAT_K, std_ratio=STAT_STD)
+        
+        n_antes = len(pcd.points)
+        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=STAT_K, std_ratio=STAT_STD)
+        n_despues = len(pcd.points)
+
+        if processed % 10 == 0:
+            eliminados = n_antes - n_despues
+            print(f"    outlier estadístico:     {eliminados:>8,} eliminados  "
+                f"({100*eliminados/n_antes:.1f}%)  "
+                f"quedan={n_despues:,}")
+
 
         # ELIMINADO: voxel_down_sample por frame
         # Antes se aplicaba aqui con VOXEL_SIZE=20, lo que tiraba puntos
@@ -713,10 +737,38 @@ def build_point_cloud(sess, vo, Q):
     n_bruto = len(pcd_combined.points)
 
     # Voxel downsample una sola vez sobre el combinado completo
+    # pcd_combined = pcd_combined.voxel_down_sample(VOXEL_SIZE)
+    # pcd_tmp, _   = pcd_combined.remove_radius_outlier(nb_points=RAD_POINTS, radius=RAD_RADIUS)
+
+    n_antes = len(pcd_combined.points)
     pcd_combined = pcd_combined.voxel_down_sample(VOXEL_SIZE)
-    pcd_tmp, _   = pcd_combined.remove_radius_outlier(
-        nb_points=RAD_POINTS, radius=RAD_RADIUS
-    )
+    print(f"\n  [PC] Voxel downsample:   {n_antes:,} → {len(pcd_combined.points):,} "
+        f"(-{n_antes - len(pcd_combined.points):,} puntos)")
+
+    # Radius outlier
+    n_antes = len(pcd_combined.points)
+    pcd_tmp, _ = pcd_combined.remove_radius_outlier(nb_points=RAD_POINTS, radius=RAD_RADIUS)
+    print(f"  [PC] Radius outlier:     {n_antes:,} → {len(pcd_tmp.points):,} "
+        f"(-{n_antes - len(pcd_tmp.points):,} puntos)")
+
+
+    # with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+    #     labels = np.array(pcd_tmp.cluster_dbscan(
+    #         eps=60.0, min_points=20, print_progress=False
+    #     ))
+
+    # if labels.max() >= 0:
+    #     counts    = np.bincount(labels[labels >= 0])
+    #     main_lbl  = int(counts.argmax())
+    #     pcd_final = pcd_tmp.select_by_index(np.where(labels == main_lbl)[0])
+    #     print(f"  [PC] DBSCAN: {len(counts)} clusters -> "
+    #           f"principal={len(pcd_final.points):,}pts  "
+    #           f"ruido={int(np.sum(labels < 0))}  "
+    #           f"otros={int(np.sum((labels >= 0) & (labels != main_lbl)))}")
+    # else:
+    #     pcd_final = pcd_tmp
+
+    n_antes = len(pcd_tmp.points)
 
     with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
         labels = np.array(pcd_tmp.cluster_dbscan(
@@ -724,15 +776,31 @@ def build_point_cloud(sess, vo, Q):
         ))
 
     if labels.max() >= 0:
-        counts    = np.bincount(labels[labels >= 0])
-        main_lbl  = int(counts.argmax())
+        counts   = np.bincount(labels[labels >= 0])
+        main_lbl = int(counts.argmax())
         pcd_final = pcd_tmp.select_by_index(np.where(labels == main_lbl)[0])
-        print(f"  [PC] DBSCAN: {len(counts)} clusters -> "
-              f"principal={len(pcd_final.points):,}pts  "
-              f"ruido={int(np.sum(labels < 0))}  "
-              f"otros={int(np.sum((labels >= 0) & (labels != main_lbl)))}")
+
+        n_ruido  = int(np.sum(labels < 0))
+        n_otros  = int(np.sum((labels >= 0) & (labels != main_lbl)))
+        n_principal = len(pcd_final.points)
+
+        print(f"\n  [PC] DBSCAN:")
+        print(f"    clusters encontrados:  {len(counts)}")
+        print(f"    cluster principal:     {n_principal:>8,} puntos  ({100*n_principal/n_antes:.1f}%)")
+        print(f"    ruido (sin cluster):   {n_ruido:>8,} puntos  ({100*n_ruido/n_antes:.1f}%)")
+        print(f"    otros clusters:        {n_otros:>8,} puntos  ({100*n_otros/n_antes:.1f}%)")
+        print(f"    eliminados total:      {n_antes - n_principal:>8,} puntos  "
+            f"({100*(n_antes - n_principal)/n_antes:.1f}%)")
+
+        # Si hay muchos clusters, listar los más grandes
+        if len(counts) > 1:
+            print(f"    tamaño de clusters:")
+            for i, c in enumerate(sorted(counts, reverse=True)[:5]):
+                marca = " ← principal" if i == 0 else ""
+                print(f"      cluster {i+1}: {c:,} puntos{marca}")
     else:
         pcd_final = pcd_tmp
+        print("  [PC] DBSCAN: sin clusters detectados, usando nube completa")
 
     # Guardar raw antes de alineacion
     pcd_raw_for_export = pcd_final.select_by_index(list(range(len(pcd_final.points))))
