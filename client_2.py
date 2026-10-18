@@ -12,7 +12,7 @@ FASE 2 - SLAM offline (al cerrar):
   lector_disco -> raft_queue -> RAFT GPU -> vo_queue -> VO CPU
   build_point_cloud -> mapa_final.ply + mapa_paredes.ply
 
-Controles: W/A/S/D = mover carrito | Q = frenar | X = salir y procesar
+Controles: W/A/S/D = mantener presionado para mover | Q = frenar | X = salir y procesar
 """
 
 import socket
@@ -30,7 +30,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from visual_odometry import VisualOdometry
+from visual_odometry import VisualOdometry, guardar_poses
 
 if os.name == 'nt':
     import msvcrt
@@ -44,7 +44,7 @@ else:
 # ==================================================================
 BASE_DIR       = Path(__file__).resolve().parent
 PI_IP          = os.environ.get('PI_IP', '10.42.0.146')
-CAL_JSON       = Path(os.environ.get('CAL_JSON', '/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/parac/estereo_cal.json'))
+CAL_JSON       = Path(os.environ.get('CAL_JSON', BASE_DIR / 'Calibracion_Camara' / 'estereo_cal.json'))
 DEFAULT_RAFT_DIR = BASE_DIR / 'RAFT-Stereo'
 LEGACY_RAFT_DIR  = Path('/home/alex/Escritorio/6tosemestre/Tridimensional/carrito/corrercudapytorch/RAFT-Stereo')
 RAFT_DIR       = Path(os.environ.get(
@@ -57,6 +57,10 @@ SAVE_FRAMES    = True
 MAX_FRAME_SIZE = 50 * 1024 * 1024
 INFER_ITERS    = 20
 PREVIEW_SCALE  = 0.5
+HEARTBEAT_S    = 0.25   # cada cuanto se manda latido al watchdog del Pi
+# Angulo de la camara respecto al piso (grados, + = hacia arriba).
+# Se usa para forzar movimiento plano. None = intentar detectar el piso.
+INCLINACION_CAMARA = None
 
 # -- RAFT-Stereo path setup ----------------------------------------
 sys.path.insert(0, str(RAFT_DIR))
@@ -349,14 +353,20 @@ def handle_commands(cmd_sock):
         with command_lock:
             command_socket = cmd_sock
 
-        print("    W/A/S/D = mover | Q = frenar | X = salir y procesar")
+        print("    W/A/S/D = mantener presionado para mover | Q = frenar | X = salir y procesar")
 
         if os.name != 'nt':
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
             tty.setraw(fd)
 
+        last_hb = 0.0
         while not stop_event.is_set():
+            # latido: si esta PC se congela, el Pi deja de recibirlo y frena
+            if time.monotonic() - last_hb > HEARTBEAT_S:
+                send_car_command('h')
+                last_hb = time.monotonic()
+
             if os.name == 'nt':
                 if msvcrt.kbhit():
                     key = msvcrt.getch()
@@ -494,7 +504,7 @@ def slam_offline(sess, model, args, Q, K_rect):
 
     raft_queue_off = queue.Queue(maxsize=4)
     vo_queue_off   = queue.Queue(maxsize=4)
-    vo             = VisualOdometry(Q, K_rect)
+    vo             = VisualOdometry(Q, K_rect, inclinacion_deg=INCLINACION_CAMARA)
 
     def lector_worker():
         for frame_idx, lp, rp in pairs:
@@ -505,6 +515,8 @@ def slam_offline(sess, model, args, Q, K_rect):
             raft_queue_off.put((frame_idx, izq, der))
         raft_queue_off.put(None)
 
+    raft_t = [0.0]   # segundos acumulados de RAFT
+
     def raft_worker():
         processed = 0
         while True:
@@ -514,7 +526,9 @@ def slam_offline(sess, model, args, Q, K_rect):
                 break
             frame_idx, izq, der = item
             try:
+                t0   = time.perf_counter()
                 disp = run_raft(model, args, izq, der)
+                raft_t[0] += time.perf_counter() - t0
                 np.save(str(disp_raw_dir / f'disp_{frame_idx:06d}.npy'), disp)
                 vo_queue_off.put((frame_idx, izq, disp))
                 processed += 1
@@ -562,6 +576,9 @@ def slam_offline(sess, model, args, Q, K_rect):
 
     print(f"\n  [SLAM] Completo: {validos[0]}/{total[0]} frames con pose valida")
     if total[0] > 0:
+        print(f"  [TIEMPO] RAFT: {raft_t[0]:.1f} s total, "
+              f"{1000*raft_t[0]/total[0]:.0f} ms por frame")
+    if total[0] > 0:
         pct = 100 * validos[0] / total[0]
         print(f"  [SLAM] Cobertura: {pct:.1f}%"
               + (" — buena" if pct > 60 else " — baja"))
@@ -588,7 +605,7 @@ def build_point_cloud(sess, vo, Q):
     # ------------------------------------------------------------------
     DISP_MIN     = 2.0    # disparidad mínima confiable
     Z_MIN        = 100.0  # profundidad mínima en mm (10cm)
-    Z_MAX        = 8000.0 # profundidad máxima en mm (8m)
+    Z_MAX        = 3000.0 # profundidad maxima en mm (arriba de 3 m el error pasa de 17 cm por px)
     VOXEL_SIZE   = 8.0   # tamaño del cubo de fusión en mm
     STAT_K       = 20     # vecinos para outlier estadístico
     STAT_STD     = 2.0    # umbral sigma
@@ -596,7 +613,11 @@ def build_point_cloud(sess, vo, Q):
     RAD_RADIUS   = 40.0   # radio de búsqueda en mm
     ICP_MIN_FIT  = 0.15   # fitness mínimo para aceptar alineación
     FRAME_STRIDE = 1      # usar todos los frames
-    MIN_POSE_MOV = 5.0    # movimiento mínimo entre frames en mm
+    # Keyframes: un frame entra a la nube solo si se movio o giro lo suficiente
+    # desde el ultimo aceptado (si el carro esta quieto no se duplican puntos)
+    MIN_POSE_MOV = 50.0   # mm
+    MIN_POSE_ROT = 5.0    # grados
+    DBSCAN_MAX   = 2_000_000  # arriba de esto DBSCAN se queda sin memoria y tumba el proceso
     # ------------------------------------------------------------------
 
     sd       = sess['sd']
@@ -606,20 +627,17 @@ def build_point_cloud(sess, vo, Q):
     poses = vo.get_all_poses()
 
     poses_path = sd / 'poses.txt'
-    with open(str(poses_path), 'w') as f:
-        f.write("frame_idx  X_mm        Y_mm        Z_mm\n")
-        for fid in sorted(poses.keys()):
-            x, y, z = poses[fid][:3, 3]
-            f.write(f"{fid:06d}    {x:12.3f}  {y:12.3f}  {z:12.3f}\n")
+    guardar_poses(poses_path, poses)
     print(f"  [PC] Trayectoria: {poses_path}  ({len(poses)} poses)")
 
     all_frame_ids = sorted(poses.keys())
     frame_ids     = all_frame_ids[::FRAME_STRIDE]
     print(f"\n  [PC] Generando nube ({len(frame_ids)} frames, stride={FRAME_STRIDE})...")
 
+    t_pc = time.perf_counter()
     pcd_combined = o3d.geometry.PointCloud()
     prev_pcd     = None
-    prev_pos     = None
+    prev_T       = None
     processed    = 0
     skipped_icp  = 0
     skipped_pose = 0
@@ -637,9 +655,14 @@ def build_point_cloud(sess, vo, Q):
         if img is None:
             continue
 
-        cur_pos = poses[frame_idx][:3, 3]
-        if prev_pos is not None:
-            if np.linalg.norm(cur_pos - prev_pos) < MIN_POSE_MOV:
+        cur_T = poses[frame_idx]
+        if prev_T is not None:
+            # movimiento relativo respecto al ultimo frame aceptado
+            rel = np.linalg.inv(prev_T) @ cur_T
+            mov = np.linalg.norm(rel[:3, 3])
+            ang = np.degrees(np.linalg.norm(cv2.Rodrigues(rel[:3, :3])[0]))
+            # se descarta solo si casi no se traslado NI giro
+            if mov < MIN_POSE_MOV and ang < MIN_POSE_ROT:
                 print(f"Frame {frame_idx:06d} descartada porque o no se movio o fue muy poco")
                 skipped_pose += 1
                 continue
@@ -719,7 +742,7 @@ def build_point_cloud(sess, vo, Q):
             continue
 
         prev_pcd      = pcd
-        prev_pos      = cur_pos
+        prev_T        = cur_T
         pcd_combined += pcd
         processed    += 1
 
@@ -727,6 +750,9 @@ def build_point_cloud(sess, vo, Q):
             print(f"  [PC] {processed} acumulados, "
                   f"{skipped_icp} ICP + {skipped_pose} pose descartados...")
 
+    print(f"  [TIEMPO] frames -> nube (incluye outlier por frame): "
+          f"{time.perf_counter() - t_pc:.1f} s")
+    t_pc = time.perf_counter()
     print(f"  [PC] Resumen: {processed} acumulados, "
           f"{skipped_icp} ICP + {skipped_pose} pose < {MIN_POSE_MOV}mm descartados")
 
@@ -770,10 +796,18 @@ def build_point_cloud(sess, vo, Q):
 
     n_antes = len(pcd_tmp.points)
 
-    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-        labels = np.array(pcd_tmp.cluster_dbscan(
-            eps=60.0, min_points=20, print_progress=False
-        ))
+    print(f"  [TIEMPO] voxel + radius outlier: {time.perf_counter() - t_pc:.1f} s")
+    t_pc = time.perf_counter()
+
+    if n_antes > DBSCAN_MAX:
+        # nube demasiado grande: se salta DBSCAN para no crashear
+        print(f"  [PC] DBSCAN omitido: {n_antes:,} puntos > {DBSCAN_MAX:,}")
+        labels = np.array([-1])
+    else:
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+            labels = np.array(pcd_tmp.cluster_dbscan(
+                eps=60.0, min_points=20, print_progress=False
+            ))
 
     if labels.max() >= 0:
         counts   = np.bincount(labels[labels >= 0])
@@ -801,6 +835,8 @@ def build_point_cloud(sess, vo, Q):
     else:
         pcd_final = pcd_tmp
         print("  [PC] DBSCAN: sin clusters detectados, usando nube completa")
+
+    print(f"  [TIEMPO] DBSCAN: {time.perf_counter() - t_pc:.1f} s")
 
     # Guardar raw antes de alineacion
     pcd_raw_for_export = pcd_final.select_by_index(list(range(len(pcd_final.points))))
@@ -927,6 +963,7 @@ def main():
                 'cal_json': str(CAL_JSON),
                 'raft_dir': str(RAFT_DIR),
                 'raft_model': str(RAFT_MODEL),
+                'inclinacion_camara_deg': INCLINACION_CAMARA,
             }
             with open(sess['sd'] / 'session_info.json', 'w', encoding='utf-8') as f:
                 json.dump(session_info, f, indent=2)
@@ -953,7 +990,7 @@ def main():
 
     print("\n> Stream iniciado.")
     print("> Fase 1: grabando frames a disco")
-    print("> W/A/S/D = mover | Q = frenar | X = salir y procesar\n")
+    print("> W/A/S/D = mantener presionado para mover | Q = frenar | X = salir y procesar\n")
 
     try:
         while not stop_event.is_set():

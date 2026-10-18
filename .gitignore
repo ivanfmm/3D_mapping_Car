@@ -1,0 +1,40 @@
+# ==================================================================
+#  3D_mapping_Car - .gitignore
+# ==================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# --- Sesiones capturadas (frames, disparidades, nubes) ---
+# Pesan cientos de MB por sesion; se regeneran con el carrito
+captured_frames/
+
+# --- RAFT-Stereo ---
+# Es otro repo (princeton-vl/RAFT-Stereo) con modelos de ~200 MB.
+# Cada quien lo clona y descarga los modelos (ver README).
+RAFT-Stereo/
+
+# --- Archivos pesados que nunca deben subirse ---
+*.pth
+*.pt
+*.npy
+*.npz
+*.ply
+*.pcd
+*.bag
+*.mp4
+*.avi
+
+# --- Editores y sistema ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+__MACOSX/

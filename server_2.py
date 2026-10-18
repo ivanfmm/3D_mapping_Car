@@ -8,17 +8,24 @@ from motor import Ordinary_Car
 car = Ordinary_Car()
 stop_event = threading.Event()
 
-WIDTH, HEIGHT = 1280, 720
+WIDTH, HEIGHT = 2560, 720  # frame completo: 2 lentes de 1280x720 lado a lado
 FPS = 30
+WATCHDOG_S = 1.0  # segundos sin recibir nada del cliente -> frenar
+
+# Velocidades (PWM de 0 a 4095). Ajustar aqui si se siente lento o brusco.
+SPEED_FWD  = 600    # avanzar / retroceder
+SPEED_TURN = 900    # girar sobre su eje (antes 1500: daba vueltas como loco)
+HOLD_S     = 0.6    # segundos que dura el movimiento tras la ultima tecla recibida
 
 COMMANDS = {
-    'w': (600, 600, 600, 600),
-    's': (-600, -600, -600, -600),
-    'a': (-1500, -1500, 1500, 1500),
-    'd': (1500, 1500, -1500, -1500),
+    'w': ( SPEED_FWD,   SPEED_FWD,   SPEED_FWD,   SPEED_FWD),
+    's': (-SPEED_FWD,  -SPEED_FWD,  -SPEED_FWD,  -SPEED_FWD),
+    'a': (-SPEED_TURN, -SPEED_TURN,  SPEED_TURN,  SPEED_TURN),
+    'd': ( SPEED_TURN,  SPEED_TURN, -SPEED_TURN, -SPEED_TURN),
     'q': (0, 0, 0, 0),
     'x': (0, 0, 0, 0),
 }
+MOVE_KEYS = {'w', 'a', 's', 'd'}
 
 
 def stop_motors():
@@ -36,10 +43,41 @@ def close_socket(sock):
 
 
 def handle_commands(conn):
-    conn.settimeout(0.2)
+    """
+    Modo "mantener presionado":
+      - Al dejar apretada una tecla, el teclado la repite (~30 veces/s)
+        y cada repeticion renueva el movimiento.
+      - Si pasan HOLD_S sin recibir la tecla (la soltaste), se frena solo.
+    Ademas, watchdog: si no llega nada (ni el latido 'h') en WATCHDOG_S, frena.
+    """
+    conn.settimeout(0.05)
+    last_rx   = time.monotonic()
+    last_move = 0.0
+    current   = 'q'          # comando que tienen ahorita los motores
+    watchdog_stopped = False
+
+    def apply(cmd):
+        # solo escribir al PCA9685 si el comando cambia (evita 30 escrituras/s)
+        nonlocal current
+        if cmd != current:
+            car.set_motor_model(*COMMANDS[cmd])
+            current = cmd
 
     try:
         while not stop_event.is_set():
+            now = time.monotonic()
+
+            # se solto la tecla -> frenar
+            if current in MOVE_KEYS and now - last_move > HOLD_S:
+                apply('q')
+
+            # watchdog: el cliente se callo (PC congelada, wifi caido)
+            if not watchdog_stopped and now - last_rx > WATCHDOG_S:
+                print("Watchdog: sin senal del cliente, frenando motores")
+                stop_motors()
+                current = 'q'
+                watchdog_stopped = True
+
             try:
                 data = conn.recv(1)
             except socket.timeout:
@@ -48,10 +86,15 @@ def handle_commands(conn):
             if not data:
                 break
 
+            last_rx = time.monotonic()
+            watchdog_stopped = False
             cmd = data.decode(errors="ignore").lower()
 
-            if cmd in COMMANDS:
-                car.set_motor_model(*COMMANDS[cmd])
+            if cmd in MOVE_KEYS:
+                last_move = last_rx
+                apply(cmd)
+            elif cmd in COMMANDS:   # 'q' o 'x'
+                apply(cmd)
 
             if cmd == 'x':
                 break
@@ -73,6 +116,8 @@ def stream_video(conn):
             print("No se pudo abrir la camara")
             return
 
+        # MJPG antes de la resolucion, igual que en la prueba que dio 2560x720
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, FPS)

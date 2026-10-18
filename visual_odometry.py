@@ -18,7 +18,8 @@ FIXES originales preservados:
 import cv2
 import numpy as np
 import faiss
-from scipy.optimize import minimize
+from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
 
 
 # ==================================================================
@@ -30,12 +31,14 @@ MIN_LOOP_INLIERS  = 6     # inliers PnP para verificacion geometrica de loop \er
 LOOP_CHECK_EVERY  = 1     # buscar loop closure en CADA frame
 LOOP_PGO_COOLDOWN = 30    # frames minimos entre corridas consecutivas de PGO
 PGO_WEIGHT_LOOP   = 5.0   # peso de edges de loop vs edges secuenciales
-PGO_MAX_ITER      = 300   # iteraciones maximas de L-BFGS-B
+PGO_MAX_ITER      = 50    # evaluaciones maximas de least_squares
+PGO_ROT_SIGMA_DEG = 1.0   # error de rotacion 'normal' por arista (grados)
+PGO_TRANS_SIGMA   = 10.0  # error de traslacion 'normal' por arista (mm)
 
 # Deteccion de saltos de odometria
 JUMP_MAX_TRANS  = 300.0   # mm  - maximo desplazamiento aceptable por frame
 JUMP_MAX_ROT    = 30.0    # grados - maxima rotacion aceptable por frame
-JUMP_RECOVER_N  = 5       # rechazos consecutivos antes de forzar recovery
+MAX_FALLOS      = 5       # frames fallidos seguidos (salto, PnP, matches...) antes de reiniciar la referencia
 
 # Parametros de matching y PnP
 LOWE_RATIO      = 0.75    # ratio test de Lowe para filtrar matches ORB
@@ -47,7 +50,39 @@ MIN_PNP_INLIERS = 12      # inliers minimos para aceptar resultado de PnP
 # Loop closure - filtro de calidad FAISS
 LC_HAMMING_MAX  = 80      # distancia Hamming maxima para contar voto valido \ era 64
 
+# Loop closure APAGADO por default (18-oct-2026).
+# Antes nunca se disparaba: FAISS busca solo el vecino mas cercano (k=1) y casi
+# siempre caia en un frame reciente (< MIN_LOOP_SEP), que se descartaba. En
+# session_20261018_114813: 476k huellas en el indice y 0 loops.
+# Al meter solo keyframes al indice si empezo a dispararse, y salieron loops
+# FALSOS (ej. 85->180 con rotacion de 142 grados, imposible si ambas vistas
+# comparten escena con ~72 grados de campo de vision). Con 6 inliers PnP no
+# basta para verificar y el PGO sin perdida robusta se desarma (recorrido de
+# 4 m -> 90 m). Prender solo para experimentar: reprocesar.py --loops
+USE_LOOP_CLOSURE = False
+
+# Loop closure - solo los keyframes entran al indice FAISS.
+# Antes se agregaban las ~1000 huellas de TODOS los frames: el indice crecia sin
+# limite (costo O(F^2)) y, con el carro quieto, se llenaba de copias casi iguales.
+LC_KF_MOV_MM    = 50.0    # mm que debe avanzar el carro desde el ultimo keyframe agregado
+LC_KF_ROT_DEG   = 5.0     # o grados que debe girar
+
 # ICP frame a frame
+# Apagado por default: con el carrito QUIETO (session_20261018_092006,
+# frames 0-39) la VO con ICP marco 0.79 m de recorrido falso y sin ICP 0.04 m.
+# El piso domina la nube y el ICP "patina" sobre el plano. Ademas era el 80%
+# del tiempo de VO (220 ms -> 45 ms por frame sin ICP).
+USE_ICP       = False
+
+# Restriccion de movimiento plano (el carrito va sobre el piso)
+# El carro solo puede avanzar, moverse de lado y girar (3 grados de libertad).
+# Subir/bajar, cabecear y alabear se fuerzan a cero en cada paso.
+USE_PLANAR        = True
+FLOOR_BAND        = 0.35    # franja de abajo de la imagen donde se busca el piso
+FLOOR_Z_MAX       = 2000.0  # mm - solo piso cercano (mas preciso)
+FLOOR_RANSAC_MM   = 10.0    # distancia maxima al plano para ser inlier
+FLOOR_MIN_RATIO   = 0.4     # fraccion minima de inliers para aceptar el plano
+FLOOR_MAX_TRIES   = 30      # frames en los que se intenta detectar el piso
 ICP_MAX_DIST  = 100.0   # mm - distancia maxima de correspondencia
 ICP_MAX_PTS   = 4000    # puntos por nube tras submuestreo (velocidad)
 ICP_MIN_FIT   = 0.25    # fitness minimo para aceptar resultado de ICP
@@ -60,6 +95,17 @@ ICP_DISP_MIN  = 2.0     # disparidad minima para incluir punto en ICP
 # ==================================================================
 #  Utilidades de poses SE(3)
 # ==================================================================
+
+def guardar_poses(ruta, poses):
+    """poses.txt: posicion (mm) y rotacion como vector de Rodrigues (grados)."""
+    with open(str(ruta), 'w') as f:
+        f.write("frame_idx  X_mm  Y_mm  Z_mm  rx_deg  ry_deg  rz_deg\n")
+        for fid in sorted(poses):
+            x, y, z = poses[fid][:3, 3]
+            r = np.degrees(cv2.Rodrigues(poses[fid][:3, :3])[0].ravel())
+            f.write(f"{fid:06d} {x:12.3f} {y:12.3f} {z:12.3f} "
+                    f"{r[0]:9.3f} {r[1]:9.3f} {r[2]:9.3f}\n")
+
 
 def mat_to_vec(T):
     """4x4 homogenea -> [rx, ry, rz, tx, ty, tz] (Rodrigues + traslacion)."""
@@ -137,61 +183,82 @@ class _LoopDetector:
 
 def _optimize_pose_graph(all_poses, seq_edges, loop_edges):
     """
-    Minimiza el error cuadratico de las restricciones de poses.
+    Optimiza el grafo de poses con minimos cuadrados (scipy least_squares).
 
-    Parametros
-    ----------
+    Cada arista aporta 6 residuos:
+      - error de rotacion (rad) / PGO_ROT_SIGMA
+      - error de traslacion (mm) / PGO_TRANS_SIGMA
+    Al dividir entre la sigma ambos quedan sin unidades, asi los mm ya no
+    dominan a los radianes.
+
+    jac_sparsity le dice a scipy que cada arista solo depende de 2 poses,
+    asi el jacobiano numerico cuesta ~12-18 evaluaciones y no 6*N.
+
     all_poses  : {frame_idx: 4x4}
     seq_edges  : [(i, j, T_rel_4x4), ...]   peso 1.0
     loop_edges : [(i, j, T_rel_4x4), ...]   peso PGO_WEIGHT_LOOP
-
-    La primera pose se fija como identidad (no se optimiza).
+    La primera pose queda fija (no es variable).
     Retorna {frame_idx: 4x4} optimizado.
     """
     frame_ids = sorted(all_poses.keys())
-    n         = len(frame_ids)
-    if n < 2:
+    if len(frame_ids) < 2:
         return all_poses
 
-    id_to_k = {fid: k for k, fid in enumerate(frame_ids)}
+    fixed_id = frame_ids[0]
+    var_ids  = frame_ids[1:]
+    col_of   = {fid: 6 * k for k, fid in enumerate(var_ids)}  # columna de cada pose
+    T_fixed  = all_poses[fixed_id]
 
-    # Vector inicial con las poses actuales convertidas a Rodrigues
-    x0 = np.zeros(6 * n)
-    for fid, T in all_poses.items():
-        k = id_to_k[fid]
-        x0[6*k : 6*k+6] = mat_to_vec(T)
+    # (i, j, inv(T_meas), sqrt(peso)); se precalcula la inversa una vez
+    edges = []
+    for lst, w in ((seq_edges, 1.0), (loop_edges, PGO_WEIGHT_LOOP)):
+        for i, j, T_meas in lst:
+            if i in all_poses and j in all_poses:
+                edges.append((i, j, np.linalg.inv(T_meas), np.sqrt(w)))
+    if not edges:
+        return all_poses
 
-    def cost(x):
-        total = 0.0
-        for edges, w in ((seq_edges, 1.0), (loop_edges, PGO_WEIGHT_LOOP)):
-            for i, j, T_meas in edges:
-                if i not in id_to_k or j not in id_to_k:
-                    continue
-                ki, kj = id_to_k[i], id_to_k[j]
-                T_i   = vec_to_mat(x[6*ki : 6*ki+6])
-                T_j   = vec_to_mat(x[6*kj : 6*kj+6])
-                T_est = np.linalg.inv(T_i) @ T_j
-                err   = np.linalg.inv(T_meas) @ T_est - np.eye(4)
-                total += w * float(np.sum(err * err))
-        return total
+    rot_sigma = np.radians(PGO_ROT_SIGMA_DEG)
 
-    # Fijar la primera pose con bounds identicos al valor inicial
-    bounds = [(None, None)] * (6 * n)
-    for k in range(6):
-        bounds[k] = (float(x0[k]), float(x0[k]))
+    def pose_of(x, fid):
+        if fid == fixed_id:
+            return T_fixed
+        c = col_of[fid]
+        return vec_to_mat(x[c:c+6])
 
-    res = minimize(
-        cost, x0,
-        method='L-BFGS-B',
-        bounds=bounds,
-        options={'maxiter': PGO_MAX_ITER, 'ftol': 1e-9},
+    def residuals(x):
+        r = np.empty(6 * len(edges))
+        for e, (i, j, T_meas_inv, sw) in enumerate(edges):
+            # error = medido^-1 * estimado; si coinciden es la identidad
+            T_err = T_meas_inv @ np.linalg.inv(pose_of(x, i)) @ pose_of(x, j)
+            rvec, _ = cv2.Rodrigues(T_err[:3, :3])
+            r[6*e   : 6*e+3] = sw * rvec.ravel() / rot_sigma
+            r[6*e+3 : 6*e+6] = sw * T_err[:3, 3] / PGO_TRANS_SIGMA
+        return r
+
+    # Patron de no-ceros del jacobiano: la arista e solo depende de i y j
+    sparsity = lil_matrix((6 * len(edges), 6 * len(var_ids)), dtype=np.int8)
+    for e, (i, j, _, _) in enumerate(edges):
+        for fid in (i, j):
+            if fid != fixed_id:
+                c = col_of[fid]
+                sparsity[6*e : 6*e+6, c : c+6] = 1
+
+    x0 = np.concatenate([mat_to_vec(all_poses[fid]) for fid in var_ids])
+
+    res = least_squares(
+        residuals, x0,
+        jac_sparsity=sparsity,
+        method='trf',
+        x_scale='jac',     # escala cada variable segun su efecto (rad vs mm)
+        max_nfev=PGO_MAX_ITER,
     )
 
-    x_opt = res.x
-    return {
-        fid: vec_to_mat(x_opt[6*id_to_k[fid] : 6*id_to_k[fid]+6])
-        for fid in frame_ids
-    }
+    out = {fixed_id: T_fixed.copy()}
+    for fid in var_ids:
+        c = col_of[fid]
+        out[fid] = vec_to_mat(res.x[c:c+6])
+    return out
 
 
 # ==================================================================
@@ -199,10 +266,13 @@ def _optimize_pose_graph(all_poses, seq_edges, loop_edges):
 # ==================================================================
 
 class VisualOdometry:
-    def __init__(self, Q, K):
+    def __init__(self, Q, K, inclinacion_deg=None):
         """
         Q : matriz de reproyeccion disparidad->3D (de cv2.stereoRectify)
         K : matriz intrinseca del lente izquierdo rectificado (P1[:3,:3])
+        inclinacion_deg : angulo de la camara respecto al piso (+ = hacia arriba).
+            Si se da, define el plano del piso para el movimiento plano.
+            Si es None, se intenta detectar el piso en las primeras imagenes.
         """
         self.Q = Q
         self.K = K
@@ -234,13 +304,25 @@ class VisualOdometry:
         self.loop_edges = []   # [(i, j, T_rel_4x4), ...]
 
         # Historial de keyframes para verificacion geometrica de loops
-        self._kf_data = {}   # {frame_idx: {'kp', 'des', 'disp'}}
+        # Solo descriptores + puntos 3D de los keypoints (~45 KB por frame).
+        # Antes se guardaba la disparidad completa (~3.7 MB por frame).
+        self._kf_data = {}   # {frame_idx: {'des', 'pts3d'}}
 
         self._loop_detector  = _LoopDetector()
         self._prev_idx       = None
         self._internal_cnt   = 0
         self._last_pgo_frame = 0
-        self._consec_reject  = 0   # rechazos consecutivos por salto de odometria
+        self._fallos         = 0     # frames fallidos seguidos desde el ultimo bueno
+        self._last_lc_pose   = None  # pose del ultimo keyframe agregado al indice de loops
+
+        # Piso: A = rotacion camara -> sistema del piso (eje Y perpendicular al piso)
+        self.A           = None
+        self.floor_info  = None   # {'origen', 'inclinacion_deg', 'alabeo_deg', ...}
+        self._floor_tries = 0
+        if USE_PLANAR and inclinacion_deg is not None:
+            # camara inclinada th hacia arriba, sin alabeo: abajo = (0, cos th, -sin th)
+            th = np.radians(inclinacion_deg)
+            self._set_floor(np.array([0.0, np.cos(th), -np.sin(th)]), {'origen': 'parametro'})
 
     # ------------------------------------------------------------------
     #  API publica
@@ -272,24 +354,34 @@ class VisualOdometry:
 
         disp = self._ensure_2d(disp)
 
+        # -- Detectar el piso (solo hasta encontrarlo) ------------------
+        if USE_PLANAR and self.A is None and self._floor_tries < FLOOR_MAX_TRIES:
+            self._floor_tries += 1
+            self._detect_floor(disp, frame_idx)
+
         # -- Extraer features -------------------------------------------
         kp, des = self.orb.detectAndCompute(gray, None)
 
         # Guardar datos del keyframe antes de cualquier retorno anticipado
-        self._kf_data[frame_idx] = {'kp': kp, 'des': des, 'disp': disp}
-        self._loop_detector.add(frame_idx, des)
+        if kp:
+            uv_kp    = np.float32([k.pt for k in kp])
+            pts3d_kp = self._deproject(uv_kp, disp)
+        else:
+            uv_kp    = np.zeros((0, 2), dtype=np.float32)
+            pts3d_kp = np.zeros((0, 3), dtype=np.float32)
+        self._kf_data[frame_idx] = {'des': des, 'pts3d': pts3d_kp, 'uv': uv_kp}
         self.all_poses[frame_idx] = self.pose.copy()
 
-        # -- Primer frame: solo guardamos estado -----------------------
+        # -- Primer frame (o referencia sin descriptores): solo guardamos estado --
         if self.prev_frame is None or self.prev_des is None:
             self._save_state(gray, kp, des, disp)
             self._prev_idx = frame_idx
+            self._add_loop_keyframe(frame_idx, des)
             return None
 
         if des is None or len(des) < 8:
             print(f"Frame  failed des < 8")
-            self._save_state(gray, kp, des, disp)
-            self._prev_idx = frame_idx
+            self._fallo(gray, kp, des, disp, frame_idx)
             return None
 
         # -- Ratio test de Lowe (reemplaza crossCheck) ----------------
@@ -300,8 +392,7 @@ class VisualOdometry:
         ]
         if len(matches) < MIN_PNP_MATCHES:
             print(f"Frame  failed matches < MIN_PNP_MATCHES")
-            self._save_state(gray, kp, des, disp)
-            self._prev_idx = frame_idx
+            self._fallo(gray, kp, des, disp, frame_idx)
             return None
 
         # -- Coordenadas 2D de correspondencias -----------------------
@@ -313,8 +404,7 @@ class VisualOdometry:
         valid = pts3d[:, 2] > 0
         if valid.sum() < MIN_PNP_INLIERS:
             print(f"Frame  failed valid.sum() < MIN_PNP_INLIERS")
-            self._save_state(gray, kp, des, disp)
-            self._prev_idx = frame_idx
+            self._fallo(gray, kp, des, disp, frame_idx)
             return None
 
         pts3d       = pts3d[valid]
@@ -329,8 +419,7 @@ class VisualOdometry:
 
         if not success or inliers is None or len(inliers) < MIN_PNP_INLIERS:
             print(f"Frame  failed not success or no inliers or inliers < MIN_PNP_INLIERS")
-            self._save_state(gray, kp, des, disp)
-            self._prev_idx = frame_idx
+            self._fallo(gray, kp, des, disp, frame_idx)
             return None
 
         R, _ = cv2.Rodrigues(rvec)
@@ -340,27 +429,23 @@ class VisualOdometry:
 
         # -- Deteccion de saltos de odometria -------------------------
         if tvec_mag > JUMP_MAX_TRANS or angle_deg > JUMP_MAX_ROT:
-            self._consec_reject += 1
             print(f"  [VO] SALTO frame {frame_idx}: "
                   f"|t|={tvec_mag:.0f}mm rot={angle_deg:.1f}deg "
-                  f"({self._consec_reject} consec.)")
-            if self._consec_reject >= JUMP_RECOVER_N:
-                # La camara se movio genuinamente lejos: forzar recovery
-                print(f"  [VO] Recovery forzada tras {JUMP_RECOVER_N} rechazos")
-                self._consec_reject = 0
-                self._save_state(gray, kp, des, disp)
-                self._prev_idx = frame_idx
-            # No acumular pose en ninguno de los dos casos
-            print(f"Frame  failed tvec_mag > JUMP_MAX_TRANS or angle_deg > JUMP_MAX_ROT")
+                  f"({self._fallos + 1} fallos seguidos)")
+            self._fallo(gray, kp, des, disp, frame_idx)
             return None
 
-        self._consec_reject = 0
+        self._fallos = 0
 
         # -- Construir T y refinar con ICP (prev->curr) ---------------
         T = np.eye(4)
         T[:3, :3] = R
         T[:3,  3] = tvec_raw
-        T = self._icp_refine(T, self.prev_disp, disp)
+        if USE_ICP:
+            T = self._icp_refine(T, self.prev_disp, disp)
+        if USE_PLANAR and self.A is not None:
+            # T mapea prev->curr; el movimiento de la camara es su inversa
+            T = np.linalg.inv(self._to_planar(np.linalg.inv(T)))
 
         # -- Acumular pose (T mapea prev_cam->curr_cam, pose es cam->world) ---
         self.pose = self.pose @ np.linalg.inv(T)
@@ -371,13 +456,113 @@ class VisualOdometry:
             T_rel = np.linalg.inv(self.all_poses[self._prev_idx]) @ self.pose
             self.seq_edges.append((self._prev_idx, frame_idx, T_rel))
 
+        self._add_loop_keyframe(frame_idx, des)
+
         # -- Loop closure (cada LOOP_CHECK_EVERY frames) --------------
-        if self._internal_cnt % LOOP_CHECK_EVERY == 0:
+        if USE_LOOP_CLOSURE and self._internal_cnt % LOOP_CHECK_EVERY == 0:
             self._check_loop_closure(frame_idx, kp, des, disp)
 
         self._save_state(gray, kp, des, disp)
         self._prev_idx = frame_idx
         return R, tvec.flatten()
+
+    def get_frame_points(self, frame_idx):
+        """
+        Puntos ORB de un frame (nube sparse):
+          uv    : (N, 2) pixeles en la imagen izquierda rectificada
+          pts3d : (N, 3) mm en coordenadas de la camara de ese frame
+                  (z = 0 si no hubo disparidad valida)
+        """
+        kf = self._kf_data.get(frame_idx)
+        if kf is None:
+            return np.zeros((0, 2), np.float32), np.zeros((0, 3), np.float32)
+        return kf['uv'], kf['pts3d']
+
+    # ------------------------------------------------------------------
+    #  Movimiento plano
+    # ------------------------------------------------------------------
+
+    def _detect_floor(self, disp, frame_idx):
+        """
+        Ajusta un plano (RANSAC) a los puntos cercanos de la franja de abajo.
+        Si es piso (normal casi vertical y suficientes inliers) guarda self.A.
+        """
+        h, w = disp.shape
+        y0 = int(h * (1 - FLOOR_BAND))
+        d  = disp[y0::4, ::4].astype(np.float32).ravel()
+        vs, us = np.mgrid[y0:h:4, 0:w:4]
+        uvd1 = np.stack([us.ravel(), vs.ravel(), d, np.ones_like(d)], axis=1)
+        uvd1 = uvd1[d > 2.0]
+        if len(uvd1) < 500:
+            return False
+        P = (self.Q @ uvd1.T).T
+        pts = P[:, :3] / P[:, 3:4]
+        pts = pts[(pts[:, 2] > 100) & (pts[:, 2] < FLOOR_Z_MAX)]
+        if len(pts) < 500:
+            return False
+
+        # RANSAC: el plano con mas puntos a menos de FLOOR_RANSAC_MM
+        rng = np.random.default_rng(0)
+        best = None
+        for _ in range(200):
+            p = pts[rng.choice(len(pts), 3, replace=False)]
+            n = np.cross(p[1] - p[0], p[2] - p[0])
+            if np.linalg.norm(n) < 1e-6:
+                continue
+            n /= np.linalg.norm(n)
+            inl = np.abs((pts - p[0]) @ n) < FLOOR_RANSAC_MM
+            if best is None or inl.sum() > best.sum():
+                best = inl
+        if best is None or best.mean() < FLOOR_MIN_RATIO:
+            return False
+
+        # Refinar con todos los inliers: normal = vector singular mas chico
+        q  = pts[best]
+        c  = q.mean(axis=0)
+        n  = np.linalg.svd(q - c)[2][2]
+        if n[1] < 0:
+            n = -n                       # que apunte hacia abajo (como el eje Y de la camara)
+        if n[1] < 0.7:
+            return False                 # no es piso: plano muy inclinado (>45 grados)
+
+        self._set_floor(n, {'origen': f'piso detectado en frame {frame_idx}',
+                            'altura_mm': float(abs(n @ c))})
+        return True
+
+    def _set_floor(self, n, info):
+        """n: normal del piso apuntando hacia abajo, en coords de la camara."""
+        n = n / np.linalg.norm(n)
+        # Sistema del piso: Y = normal (abajo), Z = frente de la camara sobre el piso
+        y_f = n
+        z_f = np.array([0.0, 0.0, 1.0]) - n[2] * n
+        z_f /= np.linalg.norm(z_f)
+        x_f = np.cross(y_f, z_f)
+        self.A = np.stack([x_f, y_f, z_f])   # filas = ejes -> camara a piso
+
+        info['inclinacion_deg'] = float(np.degrees(np.arcsin(-n[2])))  # + = hacia arriba
+        info['alabeo_deg']      = float(np.degrees(np.arcsin(n[0])))
+        self.floor_info = info
+        print(f"  [VO] Movimiento plano ({info['origen']}): inclinacion "
+              f"{info['inclinacion_deg']:+.1f} grados, alabeo {info['alabeo_deg']:+.1f} grados")
+
+    def _to_planar(self, M):
+        """
+        M: pose de la camara actual en coords de la camara anterior (4x4).
+        Lo pasa al sistema del piso, se queda solo con el giro sobre la
+        normal (yaw) y la traslacion sobre el piso, y lo regresa.
+        """
+        A = self.A
+        R = A @ M[:3, :3] @ A.T
+        t = A @ M[:3, 3]
+        # giro sobre Y: R_y = [[c,0,s],[0,1,0],[-s,0,c]]
+        yaw = np.arctan2(R[0, 2] - R[2, 0], R[0, 0] + R[2, 2])
+        c, s = np.cos(yaw), np.sin(yaw)
+        R_p = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        t_p = np.array([t[0], 0.0, t[2]])   # sin subir ni bajar
+        out = np.eye(4)
+        out[:3, :3] = A.T @ R_p @ A
+        out[:3, 3]  = A.T @ t_p
+        return out
 
     def get_all_poses(self):
         """Retorna copia del dict {frame_idx: 4x4} con todas las poses."""
@@ -406,8 +591,8 @@ class VisualOdometry:
             return
 
         T_rel = self._verify_loop(
-            kf['kp'], kf['des'], kf['disp'],
-            kp_curr, des_curr, disp_curr,
+            kf['des'], kf['pts3d'],
+            kp_curr, des_curr,
         )
         if T_rel is None:
             return
@@ -422,11 +607,12 @@ class VisualOdometry:
             self._last_pgo_frame = self._internal_cnt
             self._run_pgo()
 
-    def _verify_loop(self, kp_a, des_a, disp_a, kp_b, des_b, disp_b):
+    def _verify_loop(self, des_a, pts3d_a, kp_b, des_b):
         """
         Verificacion geometrica del loop: matchea descriptores entre el frame
         candidato (a) y el actual (b), luego verifica con PnP RANSAC.
-        Retorna T_rel 4x4 o None si la verificacion falla.
+        Retorna T_rel 4x4 en la misma convencion que los edges secuenciales
+        (inv(P_a) @ P_b, es decir mapea cam_b -> cam_a) o None si falla.
         """
         if des_a is None or des_b is None:
             return None
@@ -439,10 +625,10 @@ class VisualOdometry:
         if len(matches) < MIN_LOOP_INLIERS:
             return None
 
-        pts_a_2d = np.float32([kp_a[m.queryIdx].pt for m in matches])
+        # pts3d_a ya viene deproyectado (mismo orden que des_a)
+        pts3d    = pts3d_a[[m.queryIdx for m in matches]]
         pts_b_2d = np.float32([kp_b[m.trainIdx].pt for m in matches])
 
-        pts3d = self._deproject(pts_a_2d, disp_a)
         valid = pts3d[:, 2] > 0
         if valid.sum() < MIN_LOOP_INLIERS:
             return None
@@ -462,7 +648,11 @@ class VisualOdometry:
         T = np.eye(4)
         T[:3, :3] = R_lc
         T[:3,  3] = tvec.flatten()
-        return T
+        # PnP da a->b; el grafo usa inv(P_a) @ P_b (b->a), por eso se invierte
+        M = np.linalg.inv(T)
+        if USE_PLANAR and self.A is not None:
+            M = self._to_planar(M)
+        return M
 
     def _run_pgo(self):
         print(f"  [PGO] Optimizando {len(self.all_poses)} poses, "
@@ -548,6 +738,39 @@ class VisualOdometry:
         self.prev_kp    = kp
         self.prev_des   = des
         self.prev_disp  = disp
+
+    def _fallo(self, gray, kp, des, disp, frame_idx):
+        """
+        Frame sin pose confiable. NO se vuelve la referencia: el siguiente frame
+        se compara contra el ultimo frame bueno, asi el movimiento de este frame
+        no se pierde.
+        Si se juntan MAX_FALLOS seguidos, el ultimo bueno ya quedo muy lejos (casi
+        no comparten esquinas) y se reinicia la referencia aqui. Solo en ese caso
+        se pierde el movimiento del hueco, igual que antes.
+        """
+        self._fallos += 1
+        if self._fallos >= MAX_FALLOS:
+            print(f"  [VO] {MAX_FALLOS} fallos seguidos: nueva referencia en frame {frame_idx}")
+            self._fallos = 0
+            self._save_state(gray, kp, des, disp)
+            self._prev_idx = frame_idx
+            # conserva su pose (la ultima conocida) para no romper la cadena del grafo
+        else:
+            # sin pose propia: que no entre a la nube ni al grafo con una pose vieja
+            self.all_poses.pop(frame_idx, None)
+
+    def _add_loop_keyframe(self, frame_idx, des):
+        """Agrega las huellas al indice de loops solo si el carro se movio o giro lo suficiente."""
+        if not USE_LOOP_CLOSURE or des is None or len(des) == 0:
+            return
+        if self._last_lc_pose is not None:
+            rel = np.linalg.inv(self._last_lc_pose) @ self.pose
+            mov = np.linalg.norm(rel[:3, 3])
+            ang = np.degrees(np.linalg.norm(cv2.Rodrigues(rel[:3, :3])[0]))
+            if mov < LC_KF_MOV_MM and ang < LC_KF_ROT_DEG:
+                return
+        self._loop_detector.add(frame_idx, des)
+        self._last_lc_pose = self.pose.copy()
 
     @staticmethod
     def _ensure_2d(disp):
