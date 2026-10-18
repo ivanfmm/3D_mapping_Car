@@ -67,9 +67,11 @@ $$
 > [!tip] ¿Por qué un ratio y no un umbral fijo?
 > Un umbral fijo ("acepta si $d_1 < 50$") deja pasar parejas en losetas repetidas, donde **todas** las candidatas están cerca. El ratio pregunta otra cosa: **¿el ganador es mucho mejor que el segundo lugar?** El comentario del código explica que por eso no se usa `crossCheck`.
 
-Las parejas que sobreviven van a `solvePnPRansac`, que todavía descarta las erróneas que se colaron (*outliers*). Ver [[Odometria visual]].
+Las parejas que sobreviven van a `solvePnPRansac`, que todavía descarta las erróneas que se colaron (*outliers*). Ver [[VO 4 PnP RANSAC]].
 
 ## Nivel 2: búsqueda de lugares visitados (`_LoopDetector`)
+
+Resumen; el detalle (votos, por qué estaba muerto, verificación y PGO) está en la serie [[LC 1 Intuicion|Loop closure]], sobre todo en [[LC 3 Deteccion de candidatos]].
 
 ```python
 self.index = faiss.IndexBinaryFlat(256)     # indice binario exacto

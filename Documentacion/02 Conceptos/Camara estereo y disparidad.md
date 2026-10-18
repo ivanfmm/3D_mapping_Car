@@ -4,7 +4,7 @@ aliases: [Cámara estéreo, Disparidad, Estéreo, Profundidad]
 ---
 # Cámara estéreo y disparidad
 
-> [!info] Nivel 1 → 3 · Concepto base. Lo usan: [[03 Flujo de datos]], [[Odometria visual]], [[ORB 2 En el proyecto]]
+> [!info] Nivel 1 → 3 · Concepto base. Lo usan: [[03 Flujo de datos]], [[VO 3 Profundidad de los puntos]], [[RAFT 1 Intuicion]], [[Nube 3 Reproyeccion y keyframes]]
 
 ## Nivel 1: el truco del dedo
 
@@ -17,7 +17,7 @@ La **disparidad** es cuántos píxeles se movió un punto entre la imagen izquie
 
 ## Nivel 2: en el proyecto
 
-1. **RAFT-Stereo** ([[RAFT-Stereo]], una red neuronal en la GPU) calcula la disparidad de **cada píxel** de la imagen izquierda: `run_raft()` devuelve una matriz de 720×1280 con valores en píxeles, incluso con decimales.
+1. **RAFT-Stereo** ([[RAFT 1 Intuicion]], una red neuronal en la GPU) calcula la disparidad de **cada píxel** de la imagen izquierda: `run_raft()` devuelve una matriz de 720×1280 con valores en píxeles, incluso con decimales.
 2. Esa disparidad se convierte en distancia de dos formas:
     - Para **todos los píxeles** (nube densa): `cv2.reprojectImageTo3D(disp, Q)`
     - Solo para los **puntos ORB** (odometría): `VisualOdometry._deproject(pts2d, disp)`

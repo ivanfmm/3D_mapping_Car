@@ -4,7 +4,7 @@ aliases: [Pose, Matriz de transformación, SE(3), Rodrigues]
 ---
 # Pose y matrices 4×4
 
-> [!info] Nivel 2 → 3 · Concepto base. Lo usan: [[Odometria visual]], [[03 Flujo de datos]]
+> [!info] Nivel 2 → 3 · Concepto base. Lo usan: [[VO 6 Pose acumulada y fallos]], [[LC 5 Grafo de poses]], [[Nube 3 Reproyeccion y keyframes]]
 
 ## Nivel 1: qué es una pose
 

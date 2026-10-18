@@ -105,7 +105,7 @@ Mientras la GPU calcula la disparidad del frame *n+1*, la CPU ya está ubicando 
 
 ### Fase 3: Nube de puntos
 
-`build_point_cloud` toma cada disparidad y cada pose, convierte los píxeles en puntos 3D, los coloca en el mundo, filtra el ruido y guarda los `.ply`. El detalle está en [[03 Flujo de datos]] y en [[Nube de puntos]].
+`build_point_cloud` toma cada disparidad y cada pose, convierte los píxeles en puntos 3D, los coloca en el mundo, filtra el ruido y guarda los `.ply`. El detalle está en [[03 Flujo de datos]] y en [[Nube 2 En el proyecto]].
 
 ## Herramientas fuera del flujo principal
 

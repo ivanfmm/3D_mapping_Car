@@ -1,10 +1,10 @@
 ---
-tags: [nivel/1, nivel/2, nivel/3, tipo/algoritmo]
+tags: [nivel/1, nivel/2, nivel/3, tipo/vo]
 aliases: [Movimiento plano, Restricción plana, USE_PLANAR, Detección del piso]
 ---
-# Movimiento plano: el carro no vuela
+# VO 5: Movimiento plano (el carro no vuela)
 
-> [!info] Nivel 1 → 3 · Requisitos: [[Pose y matrices 4x4]], [[PnP RANSAC]] · Lo usa: [[Odometria visual]] (paso 7)
+> [!info] Nivel 1 → 3 · Serie VO: [[VO 1 Intuicion]] · [[VO 2 En el proyecto]] · [[VO 3 Profundidad de los puntos]] · [[VO 4 PnP RANSAC]] · **5** · [[VO 6 Pose acumulada y fallos]] · Requisito: [[Pose y matrices 4x4]]
 
 ## Nivel 1: la idea
 
@@ -61,7 +61,7 @@ En `update()`, después de PnP:
 T = np.linalg.inv(self._to_planar(np.linalg.inv(T)))
 ```
 
-`_to_planar` trabaja con el **movimiento de la cámara** (la inversa de $T$), lo aplana y se vuelve a invertir para seguir con la convención de PnP. `_verify_loop` aplica lo mismo a las aristas de loop ([[Loop closure y PGO]]).
+`_to_planar` trabaja con el **movimiento de la cámara** (la inversa de $T$), lo aplana y se vuelve a invertir para seguir con la convención de PnP. `_verify_loop` aplica lo mismo a las aristas de loop ([[LC 4 Verificacion geometrica]]).
 
 ### Paso 1: detectar el piso (`_detect_floor`)
 
@@ -150,7 +150,7 @@ $$
 P = 1 - (1 - 0.064)^{200} \approx 0.999998
 $$
 
-Sobra. (La fórmula general está en [[PnP RANSAC]].)
+Sobra. (La fórmula general está en [[VO 4 PnP RANSAC]].)
 
 ## Riesgos
 

@@ -34,7 +34,7 @@ $$
 \quad\Rightarrow\quad u = f_x \frac{X}{Z} + c_x,\ \ v = f_y \frac{Y}{Z} + c_y
 $$
 
-Esta es la ecuación que **PnP** invierte para recuperar el movimiento. Ver [[PnP RANSAC]].
+Esta es la ecuación que **PnP** invierte para recuperar el movimiento. Ver [[VO 4 PnP RANSAC]].
 
 ## Rectificación en el código (`load_rectification`)
 

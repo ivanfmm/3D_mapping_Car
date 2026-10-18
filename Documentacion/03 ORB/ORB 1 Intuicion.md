@@ -46,7 +46,7 @@ Cada huella son **256 respuestas de sí/no (bits)**. Comparar dos huellas es con
 
 En cada frame, ORB encuentra hasta **1000 esquinas**, y con ellas se hacen tres cosas:
 
-1. **Odometría:** emparejar las esquinas del frame anterior con las del actual para calcular el movimiento. Ver [[Odometria visual]].
+1. **Odometría:** emparejar las esquinas del frame anterior con las del actual para calcular el movimiento. Ver [[VO 2 En el proyecto]].
 2. **Loop closure:** reconocer un lugar visitado hace muchos frames, comparando huellas contra todo el historial.
 3. **Nube sparse** (`reprocesar.py --sparse`): dibujar el mapa usando solo esas esquinas. Es rápido, para ver la forma general.
 

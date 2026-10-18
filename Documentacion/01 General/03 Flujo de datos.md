@@ -38,7 +38,7 @@ flowchart TD
 | 3 | La PC recibe | Frame decodificado | 720×2560×3 | `read_one_frame` |
 | 4 | Parte a la mitad | `raw_izq`, `raw_der` | 720×1280×3 cada uno | `video_loop` |
 | 5 | Rectifica | `rect_izq`, `rect_der` | 720×1280×3 | `cv2.remap` |
-| 6 | RAFT ([[RAFT-Stereo]]) | Disparidad | 720×1280, `float32`, en **píxeles** | `run_raft` |
+| 6 | RAFT ([[RAFT 2 En el proyecto]]) | Disparidad | 720×1280, `float32`, en **píxeles** | `run_raft` |
 | 7 | VO | Pose del frame | 4×4 `float64`, en **mm** | `VisualOdometry.update` |
 | 8 | Reproyección | Mapa 3D | 720×1280×3 (X, Y, Z en mm) | `cv2.reprojectImageTo3D` |
 | 9 | Al mundo | Puntos filtrados | N×3 | `build_point_cloud` |
@@ -67,7 +67,7 @@ captured_frames/session_AAAAMMDD_HHMMSS/
 
 ## Fase 3 a detalle: cómo se arma la nube (`build_point_cloud`)
 
-Resumen aquí; el detalle de cada filtro está en [[Nube de puntos]].
+Resumen aquí; el detalle de cada paso está en la serie [[Nube 1 Intuicion|Nube de puntos]].
 
 Por cada frame que tiene pose:
 
@@ -93,7 +93,7 @@ Al final, sobre la nube completa:
 | **Paredes** | | `mapa_paredes.ply` = todo menos los puntos del piso |
 
 > [!tip] Cómo funcionan por dentro
-> El voxel downsample agrupa los puntos por la llave `(floor(x/8), floor(y/8), floor(z/8))` y deja el promedio de cada grupo. Los vecinos del outlier y de DBSCAN se buscan con un **KD-tree**, un árbol que parte el espacio para encontrar vecinos sin comparar contra todos los puntos. El detalle está en [[Nube de puntos]].
+> El voxel downsample agrupa los puntos por la llave `(floor(x/8), floor(y/8), floor(z/8))` y deja el promedio de cada grupo. Los vecinos del outlier y de DBSCAN se buscan con un **KD-tree**, un árbol que parte el espacio para encontrar vecinos sin comparar contra todos los puntos. El detalle está en [[Nube 5 Voxel y DBSCAN]] y [[Nube 4 Filtros de ruido]].
 
 ## Rotación del piso (nivel 3)
 

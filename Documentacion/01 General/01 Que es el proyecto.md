@@ -15,7 +15,7 @@ Un **carrito con dos ojos** (una cámara estéreo) recorre un cuarto mientras al
 Imagina que entras a un cuarto con los ojos vendados, te dejan ver solo unos segundos por paso y tienes que dibujar un mapa. Para hacerlo, en cada paso te preguntas tres cosas:
 
 1. **¿Qué tan lejos está lo que veo?** Tus dos ojos lo calculan solos: un objeto cercano se ve en lugares distintos con el ojo izquierdo y con el derecho. El proyecto hace lo mismo con dos lentes. Ver [[Camara estereo y disparidad]].
-2. **¿Cuánto me moví desde el paso anterior?** Te fijas en cosas fáciles de reconocer, como la esquina de una mesa o un cuadro en la pared, y ves cómo cambiaron de lugar. El proyecto busca esos "puntos fáciles de reconocer" con **ORB**. Ver [[ORB 1 Intuicion]] y [[Odometria visual]].
+2. **¿Cuánto me moví desde el paso anterior?** Te fijas en cosas fáciles de reconocer, como la esquina de una mesa o un cuadro en la pared, y ves cómo cambiaron de lugar. El proyecto busca esos "puntos fáciles de reconocer" con **ORB**. Ver [[ORB 1 Intuicion]] y [[VO 2 En el proyecto]].
 3. **¿Cómo junto todo?** Si sabes dónde estabas en cada paso y qué tan lejos estaba cada cosa, puedes poner cada punto en su lugar del mapa. Eso es la **nube de puntos**.
 
 A ese problema de "hacer el mapa y saber dónde estoy al mismo tiempo" se le llama **SLAM** (*Simultaneous Localization And Mapping*).
@@ -47,5 +47,5 @@ Es como grabar un video del cuarto y luego armar el mapa viendo la grabación co
 | Disparidad | Cuánto se "mueve" un punto entre la imagen izquierda y la derecha | [[Camara estereo y disparidad]] |
 | ORB | Algoritmo que encuentra esquinas y les saca una huella | [[ORB 1 Intuicion]] |
 | Pose | Dónde está el carro y hacia dónde apunta | [[Pose y matrices 4x4]] |
-| Odometría visual | Calcular cuánto te moviste usando solo imágenes | [[Odometria visual]] |
-| Nube de puntos | Muchos puntos 3D con color que forman el mapa | [[Nube de puntos]] |
+| Odometría visual | Calcular cuánto te moviste usando solo imágenes | [[VO 1 Intuicion]] |
+| Nube de puntos | Muchos puntos 3D con color que forman el mapa | [[Nube 1 Intuicion]] |
