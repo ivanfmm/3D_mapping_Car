@@ -22,9 +22,13 @@ Uso:
 
 Salidas en la carpeta de la sesion:
   nube_sparse.ply, trayectoria.ply, poses.txt   (siempre)
-  mapa_final.ply, mapa_paredes.ply              (solo sin --sparse)
+  mapa_final.ply, mapa_paredes.ply              (solo sin --sparse; alineados al piso)
+  trayectoria_alineada.ply                      (solo sin --sparse; mismo sistema que mapa_final.ply)
 
 Ver:  python ver_nube.py <sesion>/nube_sparse.ply <sesion>/trayectoria.ply
+      python ver_nube.py <sesion>/mapa_final.ply  <sesion>/trayectoria_alineada.ply
+(nube_sparse, trayectoria y mapa_final_raw comparten sistema; mapa_final y
+ trayectoria_alineada comparten otro, rotado para que Y sea la normal del piso)
 """
 import argparse
 import json
@@ -34,7 +38,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from client_2 import load_rectification, build_point_cloud, SAVE_ROOT
+from rectificacion import load_rectification
+from nube import build_point_cloud, SAVE_ROOT
 import visual_odometry
 from visual_odometry import VisualOdometry, guardar_poses
 
@@ -104,13 +109,29 @@ def main():
     print(f"Sesion: {sd}")
 
     # misma calibracion y resolucion que se usaron al capturar
-    info = json.load(open(sd / 'session_info.json', encoding='utf-8'))
+    with open(sd / 'session_info.json', encoding='utf-8') as f:
+        info = json.load(f)
     lens_w, lens_h = info['lente_izquierdo_recibido']
-    _, _, Q, K_rect = load_rectification(Path(info['cal_json']), lens_w, lens_h)
+    # 1) copia guardada dentro de la sesion (la que de verdad se uso al capturar)
+    # 2) ruta original (sesiones viejas, sin copia)  3) la del repo
+    candidatos = [sd / 'estereo_cal.json', Path(info.get('cal_json', '')),
+                  Path(__file__).resolve().parent / 'Calibracion_Camara' / 'estereo_cal.json']
+    cal_path = next((c for c in candidatos if c.is_file()), None)
+    if cal_path is None:
+        print("No encontre estereo_cal.json (ni en la sesion, ni en la ruta original, ni en el repo)")
+        return
+    if cal_path != candidatos[0]:
+        print(f"AVISO: la sesion no trae copia de la calibracion; se usa {cal_path}.")
+        print("       Si se recalibro despues de capturar, la nube saldra deformada.")
+    _, _, Q, K_rect = load_rectification(cal_path, lens_w, lens_h)
 
     disp_files = sorted((sd / 'disparity_raw').glob('disp_*.npy'))
     if a.max_frames > 0:
         disp_files = disp_files[:a.max_frames]
+    if not disp_files:
+        print(f"La sesion no tiene disparidades en {sd / 'disparity_raw'}.")
+        print("Reprocesar no corre RAFT: la sesion debe haber terminado la Fase 2 en client_2.py.")
+        return
 
     # ------------------------------------------------------------------
     # Fase 1: nitidez de cada frame
@@ -124,6 +145,9 @@ def main():
         gray = cv2.imread(str(sd / 'left_rect' / f'left_{idx:06d}.jpg'), cv2.IMREAD_GRAYSCALE)
         if gray is not None:
             nitideces[idx] = nitidez(gray)
+    if not nitideces:
+        print(f"No se pudo leer ninguna imagen en {sd / 'left_rect'}")
+        return
     valores = np.array(list(nitideces.values()))
     umbral = a.blur * np.median(valores)
     borrosos = int((valores < umbral).sum())
@@ -164,8 +188,8 @@ def main():
         # y sus puntos quedarian en el lugar equivocado)
         if ok or primero:
             uv, pts = vo.get_frame_points(idx)
-            u = np.clip(uv[:, 0].astype(int), 0, izq.shape[1] - 1)
-            v = np.clip(uv[:, 1].astype(int), 0, izq.shape[0] - 1)
+            u = np.clip(np.rint(uv[:, 0]).astype(int), 0, izq.shape[1] - 1)
+            v = np.clip(np.rint(uv[:, 1]).astype(int), 0, izq.shape[0] - 1)
             # rango de disparidad en 5x5 = max - min (dilate - erode)
             k = np.ones((5, 5), np.uint8)
             rango = cv2.dilate(disp, k) - cv2.erode(disp, k)

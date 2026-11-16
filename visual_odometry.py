@@ -3,7 +3,8 @@ visual_odometry.py - Odometria Visual Estereo con Loop Closure
 ==============================================================
 Usa ORB + BFMatcher + solvePnPRansac para estimar movimiento frame a frame.
 Detecta loop closures con FAISS (descriptores binarios ORB, distancia Hamming)
-y optimiza el grafo de poses con scipy.optimize (L-BFGS-B).
+y optimiza el grafo de poses con scipy.optimize.least_squares (TRF, jacobiano disperso).
+faiss solo se importa si el loop closure esta prendido (USE_LOOP_CLOSURE).
 
 API publica:
     vo     = VisualOdometry(Q, K_rect)
@@ -17,7 +18,6 @@ FIXES originales preservados:
 
 import cv2
 import numpy as np
-import faiss
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 
@@ -46,6 +46,9 @@ PNP_ITERATIONS  = 200     # iteraciones RANSAC de solvePnPRansac
 PNP_REPROJ_ERR  = 2.0     # error de reproyeccion en pixeles (640x360)
 MIN_PNP_MATCHES = 12      # matches minimos tras ratio test para intentar PnP
 MIN_PNP_INLIERS = 12      # inliers minimos para aceptar resultado de PnP
+# Los puntos lejanos tienen mucho error de profundidad (crece con Z^2: a 3 m ya son
+# ~17 cm por pixel de disparidad). Se dejan fuera del PnP si sobran puntos cercanos.
+PNP_Z_MAX       = 5000.0  # mm
 
 # Loop closure - filtro de calidad FAISS
 LC_HAMMING_MAX  = 80      # distancia Hamming maxima para contar voto valido \ era 64
@@ -134,6 +137,7 @@ class _LoopDetector:
     """
 
     def __init__(self):
+        import faiss   # aqui y no arriba: asi faiss no es requisito con el loop closure apagado
         self.index     = faiss.IndexBinaryFlat(256)
         self._frame_of = []   # posicion en index -> frame_idx
 
@@ -308,7 +312,7 @@ class VisualOdometry:
         # Antes se guardaba la disparidad completa (~3.7 MB por frame).
         self._kf_data = {}   # {frame_idx: {'des', 'pts3d'}}
 
-        self._loop_detector  = _LoopDetector()
+        self._loop_detector  = None   # se crea al agregar el primer keyframe de loops
         self._prev_idx       = None
         self._internal_cnt   = 0
         self._last_pgo_frame = 0
@@ -406,6 +410,10 @@ class VisualOdometry:
             print(f"Frame  failed valid.sum() < MIN_PNP_INLIERS")
             self._fallo(gray, kp, des, disp, frame_idx)
             return None
+        # Preferir puntos cercanos; si no alcanzan, usar todos como antes
+        cerca = valid & (pts3d[:, 2] < PNP_Z_MAX)
+        if cerca.sum() >= 2 * MIN_PNP_INLIERS:
+            valid = cerca
 
         pts3d       = pts3d[valid]
         pts_curr_2d = pts_curr_2d[valid]
@@ -573,6 +581,8 @@ class VisualOdometry:
     # ------------------------------------------------------------------
 
     def _check_loop_closure(self, current_idx, kp_curr, des_curr, disp_curr):
+        if self._loop_detector is None:
+            return
         candidate_idx, votes = self._loop_detector.query(des_curr, current_idx)
         if candidate_idx is None or votes < MIN_LOOP_VOTES:
             return
@@ -769,6 +779,8 @@ class VisualOdometry:
             ang = np.degrees(np.linalg.norm(cv2.Rodrigues(rel[:3, :3])[0]))
             if mov < LC_KF_MOV_MM and ang < LC_KF_ROT_DEG:
                 return
+        if self._loop_detector is None:
+            self._loop_detector = _LoopDetector()
         self._loop_detector.add(frame_idx, des)
         self._last_lc_pose = self.pose.copy()
 
@@ -794,9 +806,14 @@ class VisualOdometry:
         """
         Convierte puntos 2D + mapa de disparidad a coordenadas 3D
         usando la matriz de reproyeccion Q.
+
+        La disparidad se lee en el pixel MAS CERCANO (redondeo, no truncado;
+        no se interpola para no mezclar profundidades en los bordes) y X, Y
+        se calculan con la posicion subpixel del keypoint.
         """
         disp = self._ensure_2d(disp)
-        uv   = pts2d.astype(int)
+        pts2d = np.asarray(pts2d, dtype=np.float32).reshape(-1, 2)
+        uv   = np.rint(pts2d).astype(int)
         us   = uv[:, 0]
         vs   = uv[:, 1]
         oob  = (
@@ -808,9 +825,7 @@ class VisualOdometry:
         ds   = disp[vs_c, us_c].astype(np.float32)
         ds[oob] = 0.0
         ones  = np.ones(len(uv), dtype=np.float32)
-        pts_h = np.stack(
-            [us.astype(np.float32), vs.astype(np.float32), ds, ones], axis=1
-        )
+        pts_h = np.stack([pts2d[:, 0], pts2d[:, 1], ds, ones], axis=1)
         vecs  = (self.Q @ pts_h.T).T        # (N, 4)
         w     = vecs[:, 3:4]
         pts3d = vecs[:, :3] / np.where(np.abs(w) > 1e-6, w, 1.0)

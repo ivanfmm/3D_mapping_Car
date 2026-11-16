@@ -95,3 +95,11 @@ Habla por **I2C** (dirección `0x40`) con un chip que genera 16 señales PWM de 
 > 8. **`error_reproyeccion` en `estereo_cal.json` está mal calculado** (sale ≈ 0.045 px, el real es ≈ 0.38 px). Ver [[Calibracion estereo a fondo]].
 > 9. **El modelo de distorsión no tiene solución en las esquinas de la imagen:** desplaza el centro de la imagen rectificada y recorta una franja del campo de visión. Ver [[Calibracion estereo a fondo]].
 > 10. **RAFT no descarta la franja izquierda sin gemelo** (columnas $u < d$). Ver [[RAFT 2 En el proyecto]].
+
+> [!note] Cambios de la rama `combinacion_con_GA`
+> - `load_rectification` vive ahora en `rectificacion.py` y `build_point_cloud` en `nube.py`; `reprocesar.py` ya no necesita torch, RAFT-Stereo ni faiss.
+> - Corregidos los puntos 3, 4 y 7 de la lista de arriba. La alineación usa el piso de la odometría (`vo.A`) y rota alrededor del origen; se guarda `trayectoria_alineada.ply` en el mismo sistema que `mapa_final.ply`.
+> - Cada sesión guarda su copia de `estereo_cal.json`.
+> - La nube densa se compacta cada 20 frames y DBSCAN conserva todos los clústeres grandes, no solo el principal.
+> - `_deproject` usa la posición subpíxel del keypoint y el PnP prefiere puntos a menos de 5 m (`PNP_Z_MAX`).
+> - Las teclas WASD también funcionan con el foco en la ventana de vista previa.

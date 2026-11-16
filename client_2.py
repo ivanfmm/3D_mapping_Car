@@ -1,5 +1,5 @@
 """
-client_3.py - Cliente estereo con SLAM offline
+client_2.py - Cliente estereo con SLAM offline
 ===============================================
 Flujo en dos fases:
 
@@ -10,9 +10,10 @@ FASE 1 - Captura (en vivo):
 
 FASE 2 - SLAM offline (al cerrar):
   lector_disco -> raft_queue -> RAFT GPU -> vo_queue -> VO CPU
-  build_point_cloud -> mapa_final.ply + mapa_paredes.ply
+  build_point_cloud (nube.py) -> mapa_final.ply + mapa_paredes.ply
 
 Controles: W/A/S/D = mantener presionado para mover | Q = frenar | X = salir y procesar
+(funcionan con el foco en la terminal o en las ventanas de vista previa)
 """
 
 import socket
@@ -25,12 +26,15 @@ import time
 import csv
 import json
 import queue
+import shutil
 from pathlib import Path
 from datetime import datetime
 
 import numpy as np
 import torch
-from visual_odometry import VisualOdometry, guardar_poses
+from visual_odometry import VisualOdometry
+from rectificacion import load_rectification
+from nube import build_point_cloud, SAVE_ROOT
 
 if os.name == 'nt':
     import msvcrt
@@ -52,7 +56,6 @@ RAFT_DIR       = Path(os.environ.get(
     DEFAULT_RAFT_DIR if DEFAULT_RAFT_DIR.exists() else LEGACY_RAFT_DIR
 ))
 RAFT_MODEL     = Path(os.environ.get('RAFT_MODEL', RAFT_DIR / 'models/raftstereo-middlebury.pth'))
-SAVE_ROOT      = BASE_DIR / 'captured_frames'
 SAVE_FRAMES    = True
 MAX_FRAME_SIZE = 50 * 1024 * 1024
 INFER_ITERS    = 20
@@ -121,52 +124,6 @@ def read_one_frame(sock):
         return None, None
     return frame, frame_data
 
-
-# ==================================================================
-#  CALIBRACION Y RECTIFICACION
-# ==================================================================
-
-def load_rectification(cal_path, lens_w, lens_h):
-    with open(cal_path) as f:
-        cal = json.load(f)
-
-    cal_w, cal_h = cal['lente_izquierdo']['resolucion']
-    sx = lens_w / cal_w
-    sy = lens_h / cal_h
-
-    def scale_K(K_list):
-        K = np.array(K_list, dtype=np.float64)
-        K[0, 0] *= sx;  K[1, 1] *= sy
-        K[0, 2] *= sx;  K[1, 2] *= sy
-        return K
-
-    K_izq = scale_K(cal['lente_izquierdo']['matriz_camara'])
-    D_izq = np.array(cal['lente_izquierdo']['coef_distorsion'], dtype=np.float64)
-    K_der = scale_K(cal['lente_derecho']['matriz_camara'])
-    D_der = np.array(cal['lente_derecho']['coef_distorsion'], dtype=np.float64)
-    R     = np.array(cal['estereo']['R'], dtype=np.float64)
-    T     = np.array(cal['estereo']['T'], dtype=np.float64)
-
-    size = (lens_w, lens_h)
-    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
-        K_izq, D_izq, K_der, D_der, size, R, T, alpha=0
-    )
-
-    maps_izq = cv2.initUndistortRectifyMap(K_izq, D_izq, R1, P1, size, cv2.CV_32FC1)
-    maps_der = cv2.initUndistortRectifyMap(K_der, D_der, R2, P2, size, cv2.CV_32FC1)
-
-    print(f"  Calibracion por lente: {cal_w}x{cal_h}")
-    print(f"  Resolucion recibida por lente: {lens_w}x{lens_h}")
-    print(f"  Escala vs calibracion: sx={sx:.3f}  sy={sy:.3f}")
-    if (lens_w, lens_h) != (cal_w, cal_h):
-        print("  AVISO Resolucion de uso distinta a la calibracion.")
-        print("        Se recalculan K, mapas y Q para esta resolucion,")
-        print("        pero para mejor precision conviene capturar o recalibrar con la misma resolucion.")
-    if abs(sx - sy) > 0.05:
-        print("  AVISO Escalado no uniforme entre X/Y; la profundidad puede perder precision.")
-
-    K_rect = P1[:3, :3].copy()
-    return maps_izq, maps_der, Q, K_rect
 
 
 # ==================================================================
@@ -587,327 +544,12 @@ def slam_offline(sess, model, args, Q, K_rect):
 
 
 # ==================================================================
-#  BUILD POINT CLOUD (Fase 3)
-# ==================================================================
-
-def build_point_cloud(sess, vo, Q):
-    try:
-        import open3d as o3d
-    except ImportError:
-        print("  [PC] open3d no disponible - pip install open3d")
-        return
-
-    if sess is None or not SAVE_FRAMES:
-        return
-
-    # ------------------------------------------------------------------
-    # PARAMETROS  (ajustados para mayor densidad de puntos)
-    # ------------------------------------------------------------------
-    DISP_MIN     = 2.0    # disparidad mínima confiable
-    Z_MIN        = 100.0  # profundidad mínima en mm (10cm)
-    Z_MAX        = 3000.0 # profundidad maxima en mm (arriba de 3 m el error pasa de 17 cm por px)
-    VOXEL_SIZE   = 8.0   # tamaño del cubo de fusión en mm
-    STAT_K       = 20     # vecinos para outlier estadístico
-    STAT_STD     = 2.0    # umbral sigma
-    RAD_POINTS   = 8      # vecinos mínimos para outlier radial
-    RAD_RADIUS   = 40.0   # radio de búsqueda en mm
-    ICP_MIN_FIT  = 0.15   # fitness mínimo para aceptar alineación
-    FRAME_STRIDE = 1      # usar todos los frames
-    # Keyframes: un frame entra a la nube solo si se movio o giro lo suficiente
-    # desde el ultimo aceptado (si el carro esta quieto no se duplican puntos)
-    MIN_POSE_MOV = 50.0   # mm
-    MIN_POSE_ROT = 5.0    # grados
-    DBSCAN_MAX   = 2_000_000  # arriba de esto DBSCAN se queda sin memoria y tumba el proceso
-    # ------------------------------------------------------------------
-
-    sd       = sess['sd']
-    raw_dir  = sd / 'disparity_raw'
-    left_dir = sd / 'left_rect'
-
-    poses = vo.get_all_poses()
-
-    poses_path = sd / 'poses.txt'
-    guardar_poses(poses_path, poses)
-    print(f"  [PC] Trayectoria: {poses_path}  ({len(poses)} poses)")
-
-    all_frame_ids = sorted(poses.keys())
-    frame_ids     = all_frame_ids[::FRAME_STRIDE]
-    print(f"\n  [PC] Generando nube ({len(frame_ids)} frames, stride={FRAME_STRIDE})...")
-
-    t_pc = time.perf_counter()
-    pcd_combined = o3d.geometry.PointCloud()
-    prev_pcd     = None
-    prev_T       = None
-    processed    = 0
-    skipped_icp  = 0
-    skipped_pose = 0
-    first_done   = False
-
-    for frame_idx in frame_ids:
-        disp_path = raw_dir  / f'disp_{frame_idx:06d}.npy'
-        left_path = left_dir / f'left_{frame_idx:06d}.jpg'
-
-        if not disp_path.exists() or not left_path.exists():
-            continue
-
-        disp = np.load(str(disp_path)).astype(np.float32)
-        img  = cv2.imread(str(left_path))
-        if img is None:
-            continue
-
-        cur_T = poses[frame_idx]
-        if prev_T is not None:
-            # movimiento relativo respecto al ultimo frame aceptado
-            rel = np.linalg.inv(prev_T) @ cur_T
-            mov = np.linalg.norm(rel[:3, 3])
-            ang = np.degrees(np.linalg.norm(cv2.Rodrigues(rel[:3, :3])[0]))
-            # se descarta solo si casi no se traslado NI giro
-            if mov < MIN_POSE_MOV and ang < MIN_POSE_ROT:
-                print(f"Frame {frame_idx:06d} descartada porque o no se movio o fue muy poco")
-                skipped_pose += 1
-                continue
-
-        pts3d = cv2.reprojectImageTo3D(disp, Q)
-
-        if not first_done:
-            z_all  = pts3d[:, :, 2]
-            vmask  = (disp > DISP_MIN) & np.isfinite(z_all) & (z_all > 0)
-            sample = pts3d[vmask][:10]
-            print(f"  [PC] Q:\n{np.array2string(Q, precision=4, suppress_small=True)}")
-            print("  [PC] Primeros 10 puntos 3D validos:")
-            for p in sample:
-                print(f"       X={p[0]:8.1f}  Y={p[1]:8.1f}  Z={p[2]:8.1f}")
-            first_done = True
-
-        z    = pts3d[:, :, 2]
-        # mask = (disp > DISP_MIN) & np.isfinite(z) & (z > Z_MIN) & (z < Z_MAX)
-        total_px = disp.size  # total de píxeles en el frame
-        # Filtro 1 — disparidad mínima
-        m1 = disp > DISP_MIN
-        # Filtro 2 — valores finitos
-        m2 = np.isfinite(z)
-        # Filtro 3 — profundidad mínima
-        m3 = z > Z_MIN
-        # Filtro 4 — profundidad máxima
-        m4 = z < Z_MAX
-
-        # Combinado final
-        mask = m1 & m2 & m3 & m4
-
-        if processed % 10 == 0:
-            print(f"\n  [PC] frame {frame_idx:05d} — {total_px:,} píxeles totales")
-            print(f"    disp < {DISP_MIN}  (sin info):  {(~m1).sum():>8,} eliminados  ({100*(~m1).sum()/total_px:.1f}%)")
-            print(f"    infinitos/NaN:           {(~m2).sum():>8,} eliminados  ({100*(~m2).sum()/total_px:.1f}%)")
-            print(f"    z < {Z_MIN}mm (muy cerca): {(~m3).sum():>8,} eliminados  ({100*(~m3).sum()/total_px:.1f}%)")
-            print(f"    z > {Z_MAX}mm (muy lejos): {(~m4).sum():>8,} eliminados  ({100*(~m4).sum()/total_px:.1f}%)")
-            print(f"    QUEDAN:                  {mask.sum():>8,} puntos     ({100*mask.sum()/total_px:.1f}%)")
-
-        pts  = pts3d[mask].astype(np.float64)
-        cols = img[mask][:, ::-1].astype(np.float64) / 255.0
-
-        if len(pts) < STAT_K + 1:
-            continue
-
-        T_pose = poses[frame_idx]
-        pts_h  = np.hstack([pts, np.ones((len(pts), 1))])
-        pts_w  = (T_pose @ pts_h.T).T[:, :3]
-
-        valid_w = np.all(np.isfinite(pts_w), axis=1)
-        pts_w   = pts_w[valid_w]
-        cols    = cols[valid_w]
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts_w)
-        pcd.colors = o3d.utility.Vector3dVector(cols)
-
-        # Filtro estadistico por frame (mantener, es util para ruido local)
-        # pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=STAT_K, std_ratio=STAT_STD)
-        
-        n_antes = len(pcd.points)
-        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=STAT_K, std_ratio=STAT_STD)
-        n_despues = len(pcd.points)
-
-        if processed % 10 == 0:
-            eliminados = n_antes - n_despues
-            print(f"    outlier estadístico:     {eliminados:>8,} eliminados  "
-                f"({100*eliminados/n_antes:.1f}%)  "
-                f"quedan={n_despues:,}")
-
-
-        # ELIMINADO: voxel_down_sample por frame
-        # Antes se aplicaba aqui con VOXEL_SIZE=20, lo que tiraba puntos
-        # prematuramente. Ahora solo se aplica una vez al combinado final.
-
-        if len(pcd.points) < 50:
-            continue
-
-        prev_pcd      = pcd
-        prev_T        = cur_T
-        pcd_combined += pcd
-        processed    += 1
-
-        if processed % 10 == 0:
-            print(f"  [PC] {processed} acumulados, "
-                  f"{skipped_icp} ICP + {skipped_pose} pose descartados...")
-
-    print(f"  [TIEMPO] frames -> nube (incluye outlier por frame): "
-          f"{time.perf_counter() - t_pc:.1f} s")
-    t_pc = time.perf_counter()
-    print(f"  [PC] Resumen: {processed} acumulados, "
-          f"{skipped_icp} ICP + {skipped_pose} pose < {MIN_POSE_MOV}mm descartados")
-
-    if len(pcd_combined.points) == 0:
-        print("  [PC] Nube vacia, no se genera archivo")
-        return
-
-    n_bruto = len(pcd_combined.points)
-
-    # Voxel downsample una sola vez sobre el combinado completo
-    # pcd_combined = pcd_combined.voxel_down_sample(VOXEL_SIZE)
-    # pcd_tmp, _   = pcd_combined.remove_radius_outlier(nb_points=RAD_POINTS, radius=RAD_RADIUS)
-
-    n_antes = len(pcd_combined.points)
-    pcd_combined = pcd_combined.voxel_down_sample(VOXEL_SIZE)
-    print(f"\n  [PC] Voxel downsample:   {n_antes:,} → {len(pcd_combined.points):,} "
-        f"(-{n_antes - len(pcd_combined.points):,} puntos)")
-
-    # Radius outlier
-    n_antes = len(pcd_combined.points)
-    pcd_tmp, _ = pcd_combined.remove_radius_outlier(nb_points=RAD_POINTS, radius=RAD_RADIUS)
-    print(f"  [PC] Radius outlier:     {n_antes:,} → {len(pcd_tmp.points):,} "
-        f"(-{n_antes - len(pcd_tmp.points):,} puntos)")
-
-
-    # with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-    #     labels = np.array(pcd_tmp.cluster_dbscan(
-    #         eps=60.0, min_points=20, print_progress=False
-    #     ))
-
-    # if labels.max() >= 0:
-    #     counts    = np.bincount(labels[labels >= 0])
-    #     main_lbl  = int(counts.argmax())
-    #     pcd_final = pcd_tmp.select_by_index(np.where(labels == main_lbl)[0])
-    #     print(f"  [PC] DBSCAN: {len(counts)} clusters -> "
-    #           f"principal={len(pcd_final.points):,}pts  "
-    #           f"ruido={int(np.sum(labels < 0))}  "
-    #           f"otros={int(np.sum((labels >= 0) & (labels != main_lbl)))}")
-    # else:
-    #     pcd_final = pcd_tmp
-
-    n_antes = len(pcd_tmp.points)
-
-    print(f"  [TIEMPO] voxel + radius outlier: {time.perf_counter() - t_pc:.1f} s")
-    t_pc = time.perf_counter()
-
-    if n_antes > DBSCAN_MAX:
-        # nube demasiado grande: se salta DBSCAN para no crashear
-        print(f"  [PC] DBSCAN omitido: {n_antes:,} puntos > {DBSCAN_MAX:,}")
-        labels = np.array([-1])
-    else:
-        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
-            labels = np.array(pcd_tmp.cluster_dbscan(
-                eps=60.0, min_points=20, print_progress=False
-            ))
-
-    if labels.max() >= 0:
-        counts   = np.bincount(labels[labels >= 0])
-        main_lbl = int(counts.argmax())
-        pcd_final = pcd_tmp.select_by_index(np.where(labels == main_lbl)[0])
-
-        n_ruido  = int(np.sum(labels < 0))
-        n_otros  = int(np.sum((labels >= 0) & (labels != main_lbl)))
-        n_principal = len(pcd_final.points)
-
-        print(f"\n  [PC] DBSCAN:")
-        print(f"    clusters encontrados:  {len(counts)}")
-        print(f"    cluster principal:     {n_principal:>8,} puntos  ({100*n_principal/n_antes:.1f}%)")
-        print(f"    ruido (sin cluster):   {n_ruido:>8,} puntos  ({100*n_ruido/n_antes:.1f}%)")
-        print(f"    otros clusters:        {n_otros:>8,} puntos  ({100*n_otros/n_antes:.1f}%)")
-        print(f"    eliminados total:      {n_antes - n_principal:>8,} puntos  "
-            f"({100*(n_antes - n_principal)/n_antes:.1f}%)")
-
-        # Si hay muchos clusters, listar los más grandes
-        if len(counts) > 1:
-            print(f"    tamaño de clusters:")
-            for i, c in enumerate(sorted(counts, reverse=True)[:5]):
-                marca = " ← principal" if i == 0 else ""
-                print(f"      cluster {i+1}: {c:,} puntos{marca}")
-    else:
-        pcd_final = pcd_tmp
-        print("  [PC] DBSCAN: sin clusters detectados, usando nube completa")
-
-    print(f"  [TIEMPO] DBSCAN: {time.perf_counter() - t_pc:.1f} s")
-
-    # Guardar raw antes de alineacion
-    pcd_raw_for_export = pcd_final.select_by_index(list(range(len(pcd_final.points))))
-    out_raw = str(sd / 'mapa_final_raw.ply')
-    o3d.io.write_point_cloud(out_raw, pcd_raw_for_export)
-    print(f"  [PC] Guardado raw sin alineacion: {out_raw}")
-
-    # Detectar suelo y alinear
-    floor_inliers = None
-    R_align       = np.eye(3)
-
-    try:
-        plane_model, inliers = pcd_final.segment_plane(
-            distance_threshold=30.0, ransac_n=3, num_iterations=1000
-        )
-        floor_inliers = inliers
-        a, b, c, d   = plane_model
-        normal        = np.array([a, b, c], dtype=np.float64)
-        normal       /= np.linalg.norm(normal)
-        if normal[1] < 0:
-            normal = -normal
-
-        target = np.array([0.0, 1.0, 0.0])
-        v      = np.cross(normal, target)
-        s      = np.linalg.norm(v)
-        cos_a  = np.dot(normal, target)
-
-        if s > 1e-6:
-            vx = np.array([
-                [0,    -v[2],  v[1]],
-                [v[2],  0,    -v[0]],
-                [-v[1], v[0],  0   ],
-            ])
-            R_align = np.eye(3) + vx + vx @ vx * ((1 - cos_a) / (s * s))
-
-        print(f"  [PC] Suelo detectado: normal={np.round(normal,3)}, inliers={len(inliers)}")
-
-    except Exception as e:
-        print(f"  [PC] segment_plane fallo: {e}")
-
-    if floor_inliers is not None:
-        pcd_walls = pcd_final.select_by_index(floor_inliers, invert=True)
-    else:
-        pcd_walls = pcd_final
-
-    out_walls_raw = str(sd / 'mapa_paredes_raw.ply')
-    o3d.io.write_point_cloud(out_walls_raw, pcd_walls)
-    print(f"  [PC] Guardado paredes raw sin alineacion: {out_walls_raw}")
-
-    center = pcd_final.get_center()
-    pcd_final.rotate(R_align, center=center)
-    pcd_walls.rotate(R_align, center=center)
-
-    out_final = str(sd / 'mapa_final.ply')
-    out_walls = str(sd / 'mapa_paredes.ply')
-
-    o3d.io.write_point_cloud(out_final, pcd_final)
-    o3d.io.write_point_cloud(out_walls, pcd_walls)
-
-    print(f"\n  [PC] Bruto: {n_bruto:,} -> final: {len(pcd_final.points):,} puntos")
-    print(f"  [PC] Guardado: {out_final}")
-    print(f"  [PC] Guardado: {out_walls}")
-
-
-# ==================================================================
 #  MAIN
 # ==================================================================
 
 def main():
     print("=" * 58)
-    print("  client_3.py - Stereo SLAM offline")
+    print("  client_2.py - Stereo SLAM offline")
     print("=" * 58)
 
     print("\n[1/4] Cargando RAFT-Stereo en GPU...")
@@ -961,14 +603,18 @@ def main():
                 'calibracion_por_lente': cal_res,
                 'escala_vs_calibracion': [lens_w / cal_res[0], lens_h / cal_res[1]],
                 'cal_json': str(CAL_JSON),
+                'cal_json_sesion': 'estereo_cal.json',
                 'raft_dir': str(RAFT_DIR),
                 'raft_model': str(RAFT_MODEL),
                 'inclinacion_camara_deg': INCLINACION_CAMARA,
             }
             with open(sess['sd'] / 'session_info.json', 'w', encoding='utf-8') as f:
                 json.dump(session_info, f, indent=2)
+            # Copia de la calibracion usada: si despues se recalibra, esta sesion
+            # se puede reprocesar con la misma Q con la que se rectificaron sus frames.
+            shutil.copyfile(CAL_JSON, sess['sd'] / 'estereo_cal.json')
         except Exception as e:
-            print(f"  AVISO No se pudo escribir session_info.json: {e}")
+            print(f"  AVISO No se pudo escribir session_info.json / copiar calibracion: {e}")
 
     t_save = threading.Thread(
         target=save_worker, args=(sess,), daemon=True, name='Save-IO'
@@ -1005,15 +651,21 @@ def main():
                 cv2.imshow('Derecho rectificado',
                            cv2.resize(der, (0, 0), fx=PREVIEW_SCALE, fy=PREVIEW_SCALE))
 
-            key = cv2.waitKey(33) & 0xFF
-            if key == ord('x'):
+            # Las teclas tambien se atienden aqui: si el foco esta en la ventana
+            # de vista previa, la terminal no las recibe.
+            key = chr(cv2.waitKey(33) & 0xFF).lower()
+            if key == 'x':
                 request_shutdown()
                 break
+            if key in {'w', 'a', 's', 'd', 'q'}:
+                send_car_command(key)
 
         cv2.destroyAllWindows()
 
     finally:
-        stop_event.set()
+        # request_shutdown (y no solo stop_event.set) para que el Pi reciba
+        # 'q' y 'x' tambien cuando se sale con Ctrl+C o por una excepcion
+        request_shutdown()
         t_video.join(timeout=5)
         if SAVE_FRAMES:
             save_queue.put(None)

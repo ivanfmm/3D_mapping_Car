@@ -1,0 +1,15 @@
+# Dependencias de la PC (client_2.py, reprocesar.py, ver_nube.py, calibracion)
+numpy
+opencv-python
+scipy
+open3d
+
+# Solo para capturar y correr RAFT-Stereo (client_2.py). Instalar la version de
+# torch que corresponda a tu CUDA: https://pytorch.org/get-started/locally/
+torch
+
+# Solo si se prende el loop closure (reprocesar.py --loops)
+# faiss-cpu
+
+# En la Raspberry Pi (server_2.py, motor.py, pca9685.py):
+#   sudo apt install python3-opencv python3-smbus
