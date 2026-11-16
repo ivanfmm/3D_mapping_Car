@@ -38,3 +38,8 @@ RAFT-Stereo/
 Thumbs.db
 desktop.ini
 __MACOSX/
+
+# --- Datos del algoritmo genetico (KITTI 07, ~8 GB; ver GA/README.md) ---
+GA/07/image_*/
+GA/disparidad/
+GA/drivedownload/
