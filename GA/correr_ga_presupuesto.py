@@ -46,6 +46,34 @@ FRAMES_BENCH = 120
 MIN_GENERACIONES = 10
 
 
+# Rangos ampliados (--amplio): la primera corrida dejo varios parametros pegados
+# al limite del rango original de optimize_ga.GENE_SPECS.
+GENE_SPECS_AMPLIO = [
+    ("orb_nfeatures",     300.0,  3000.0, True),
+    ("orb_scaleFactor",   1.10,   2.00,   False),
+    ("orb_nlevels",       2.0,    10.0,   True),
+    ("orb_patchSize",     15.0,   48.0,   True),
+    ("orb_fastThreshold", 5.0,    40.0,   True),
+    ("lowe_ratio",        0.40,   0.90,   False),
+    ("disp_min",          1.0,    30.0,   False),
+    ("pnp_iterations",    100.0,  800.0,  True),
+    ("pnp_reproj_err",    0.50,   8.00,   False),
+    ("min_pnp_inliers",   8.0,    80.0,   True),
+    ("floor_band",        0.20,   0.45,   False),
+    ("floor_ransac_mm",   15.0,   80.0,   False),
+]
+MAX_GENERACIONES = 60
+
+
+def _evaluar_params(params):
+    """Worker: recibe el diccionario ya decodificado (el rango lo decide el proceso padre)."""
+    try:
+        return evaluate_vo_params(params, og._WORKER_CACHE)
+    except Exception as e:
+        return 1e6, {"ate_rmse": None, "rpe_trans_rmse": None, "rpe_rot_rmse": None,
+                     "coverage": 0.0, "valid": False, "error": repr(e)}
+
+
 def ram_libre_gb():
     try:
         if os.name == 'nt':
@@ -122,7 +150,10 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--min-gens', type=int, default=MIN_GENERACIONES,
                     help='generaciones minimas antes de recortar frames')
+    ap.add_argument('--amplio', action='store_true', help='usar GENE_SPECS_AMPLIO')
     a = ap.parse_args()
+    if a.amplio:
+        og.GENE_SPECS[:] = GENE_SPECS_AMPLIO
 
     t_inicio = time.perf_counter()
     limite_s = a.minutos * 60.0
@@ -189,23 +220,27 @@ def main():
     if previo.exists():
         sembrados.append(('mejor previo (best_vo_params.json del repo)',
                           encode_params(json.load(open(previo))['best_params'])))
+    anteriores = sorted(AQUI.glob('resultados_*/best_vo_params.json'))
+    if anteriores:
+        sembrados.append((f'mejor de la corrida anterior ({anteriores[-1].parent.name})',
+                          encode_params(json.load(open(anteriores[-1]))['best_params'])))
     for k, (_, genes) in enumerate(sembrados):
         pop[k][:] = genes
 
     hof = tools.HallOfFame(maxsize=5)
     historia, filas_ind, ref = [], [], {}
     cx_prob, mut_prob, elite = 0.75, 0.35, 2
-    motivo_fin = 'se completaron las generaciones planeadas'
+    motivo_fin = f'se llego al maximo de {MAX_GENERACIONES} generaciones'
     t_gens = []
 
     with mp.Pool(workers, initializer=og._init_worker,
                  initargs=(str(seq_dir), str(disp_dir), str(gt_file), 0, plan['frames'])) as pool:
         t_ag = time.perf_counter()
-        for gen in range(plan['gens'] + 1):
+        for gen in range(MAX_GENERACIONES + 1):
             t_gen = time.perf_counter()
             pend = [ind for ind in pop if not ind.fitness.valid]
             if pend:
-                for ind, (fit, info) in zip(pend, pool.map(og._evaluate_worker, pend, chunksize=1)):
+                for ind, (fit, info) in zip(pend, pool.map(_evaluar_params, [og.decode_individual(i) for i in pend], chunksize=1)):
                     ind.fitness.values = (fit,)
                     ind.metrics = info
                     filas_ind.append([gen, fit, info.get('ate_rmse'), info.get('rpe_trans_rmse'),
@@ -231,7 +266,7 @@ def main():
                        'best_params': og.decode_individual(mejor)},
                       open(out / 'best_vo_params.json', 'w', encoding='utf-8'), indent=4)
 
-            if gen == plan['gens']:
+            if gen == MAX_GENERACIONES:
                 break
             # Corte por reloj: la siguiente generacion debe caber (con la mas lenta vista hasta ahora)
             t_sig = max(t_gens[1:]) if len(t_gens) > 1 else t_gens[0]
@@ -299,7 +334,8 @@ def main():
           f'(0.35 base + 0.65 pesado, por {FACTOR_PARALELO} de perdida al usar todos los nucleos).',
           f'- Memoria por worker: {gb_worker:.2f} GB ({mb_frame:.2f} MB por frame). '
           f'Workers: {workers} (CPU permite {w_cpu}, RAM permite {w_ram}).',
-          f'- Plan elegido: {plan["frames"]} frames, poblacion {plan["pop"]}, hasta {plan["gens"]} generaciones, '
+          f'- Plan elegido: {plan["frames"]} frames, poblacion {plan["pop"]}, {plan["gens"]} generaciones estimadas '
+          f'(se siguen corriendo generaciones mientras quepan en el limite), '
           f'~{plan["t_eval"]:.0f} s por evaluacion, total estimado {plan["total"]/60:.1f} min '
           f'de {presupuesto_s/60:.1f} planeables ({MARGEN:.0%} del limite).',
           f'- Real: generacion 0 en {t_gens[0]:.0f} s; las demas en promedio '
@@ -310,6 +346,7 @@ def main():
     L += ['', '## Configuracion del AG', '',
           f'- Cruce SBX (eta 15, prob. {cx_prob}), mutacion polinomial (eta 20, indpb 0.25, prob. {mut_prob}), '
           f'torneo de 3, elitismo de {elite}, semilla {a.seed}.',
+          f'- Rangos de busqueda: {"ampliados (--amplio)" if a.amplio else "originales de optimize_ga.py"}.',
           f'- Poblacion inicial sembrada con: {"; ".join(n for n, _ in sembrados)}.', '']
     L += ['## Convergencia', '',
           '| Gen | Evaluados | Mejor fitness | ATE (m) | Fitness medio | Validos | Tiempo (s) |', '|---|---|---|---|---|---|---|']

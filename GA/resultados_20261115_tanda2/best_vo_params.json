@@ -1,0 +1,36 @@
+{
+    "generation": 39,
+    "best_fitness": 4.779925669901879,
+    "metrics": {
+        "ate_rmse": 4.666243582557098,
+        "rpe_trans_rmse": 0.08758044311873678,
+        "rpe_rot_rmse": 0.2610164422604435,
+        "coverage": 1.0,
+        "valid": true
+    },
+    "best_params": {
+        "orb_nfeatures": 1157,
+        "orb_scaleFactor": 1.457,
+        "orb_nlevels": 5,
+        "orb_edgeThreshold": 32,
+        "orb_patchSize": 32,
+        "orb_fastThreshold": 18,
+        "lowe_ratio": 0.6149,
+        "disp_min": 9.9935,
+        "pnp_iterations": 382,
+        "pnp_reproj_err": 2.8054,
+        "min_pnp_matches": 33,
+        "min_pnp_inliers": 33,
+        "jump_max_trans": 2500.0,
+        "jump_max_rot": 20.0,
+        "max_fallos": 5,
+        "use_planar": true,
+        "floor_band": 0.3191,
+        "floor_z_max": 15000.0,
+        "floor_ransac_mm": 22.8674,
+        "floor_min_ratio": 0.4,
+        "floor_max_tries": 30,
+        "use_icp": false,
+        "use_loop_closure": false
+    }
+}

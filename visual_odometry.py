@@ -42,27 +42,27 @@ MAX_FALLOS      = 5       # frames fallidos seguidos (salto, PnP, matches...) an
 
 # ------------------------------------------------------------------
 # Hiperparametros del algoritmo genetico (GA/reporte_GA.md, 15-nov-2026).
-# Optimizados sobre KITTI 07 (1101 frames): ATE 11.92 m -> 4.90 m.
+# Optimizados sobre KITTI 07 (1101 frames, 2 tandas): ATE 11.92 m -> 4.67 m.
 # Entre parentesis, el valor que habia antes. OJO: salen de un auto en la
 # calle; falta validarlos con una sesion del carrito (reprocesar.py).
 # ------------------------------------------------------------------
 # ORB
 ORB_NFEATURES      = 1157    # (1000)
-ORB_SCALE_FACTOR   = 1.4844  # (1.2)
+ORB_SCALE_FACTOR   = 1.457   # (1.2)
 ORB_NLEVELS        = 5       # (6)
 ORB_PATCH_SIZE     = 32      # (19) tambien es el edgeThreshold
 ORB_FAST_THRESHOLD = 18      # (10) mas alto = menos esquinas en zonas de poca textura
 
 # Parametros de matching y PnP
 LOWE_RATIO      = 0.6149  # (0.75) ratio test de Lowe para filtrar matches ORB
-PNP_ITERATIONS  = 418     # (200)  iteraciones RANSAC de solvePnPRansac
-PNP_REPROJ_ERR  = 3.9744  # (2.0)  error de reproyeccion en pixeles
-MIN_PNP_MATCHES = 38      # (12)   matches minimos tras ratio test para intentar PnP
-MIN_PNP_INLIERS = 38      # (12)   inliers minimos para aceptar resultado de PnP
+PNP_ITERATIONS  = 382     # (200)  iteraciones RANSAC de solvePnPRansac
+PNP_REPROJ_ERR  = 2.8054  # (2.0)  error de reproyeccion en pixeles
+MIN_PNP_MATCHES = 33      # (12)   matches minimos tras ratio test para intentar PnP
+MIN_PNP_INLIERS = 33      # (12)   inliers minimos para aceptar resultado de PnP
 # Disparidad minima para confiar en la profundidad de un keypoint.
 # Con la camara del carrito (~900 px de focal, 59 mm de base) 10 px son ~5.4 m.
 VO_DISP_MIN     = 9.9935  # (2.0)
-# NO se aplico floor_ransac_mm = 25.8 del AG: depende de la escala de la escena
+# NO se aplico floor_ransac_mm = 22.9 del AG: depende de la escala de la escena
 # (KITTI: camara a 1.65 m del piso; carrito: unos centimetros). Se queda en 10 mm.
 # Los puntos lejanos tienen mucho error de profundidad (crece con Z^2: a 3 m ya son
 # ~17 cm por pixel de disparidad). Se dejan fuera del PnP si sobran puntos cercanos.
@@ -99,7 +99,7 @@ USE_ICP       = False
 # El carro solo puede avanzar, moverse de lado y girar (3 grados de libertad).
 # Subir/bajar, cabecear y alabear se fuerzan a cero en cada paso.
 USE_PLANAR        = True
-FLOOR_BAND        = 0.3205  # (0.35, valor del AG) franja de abajo de la imagen donde se busca el piso
+FLOOR_BAND        = 0.3191  # (0.35, valor del AG) franja de abajo de la imagen donde se busca el piso
 FLOOR_Z_MAX       = 2000.0  # mm - solo piso cercano (mas preciso)
 FLOOR_RANSAC_MM   = 10.0    # distancia maxima al plano para ser inlier
 FLOOR_MIN_RATIO   = 0.4     # fraccion minima de inliers para aceptar el plano
